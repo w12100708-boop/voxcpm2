@@ -1,0 +1,11 @@
+[project]
+name = "voxcpm2-ncnn"
+version = "0.1.0"
+description = "VoxCPM2 TTS runtime and exporter for ncnn"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ncnn>=1.0.20260526",
+    "pnnx>=20260526",
+    "voxcpm>=2.0.3",
+]

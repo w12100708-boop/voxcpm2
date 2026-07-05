@@ -1,0 +1,16 @@
+voxcpm2-ncnn
+
+The project is distributed primarily under the MIT license in LICENSE.
+
+Small portions of the runtime are derivative work of Apache-2.0 licensed
+`ncnn_llm` code that was reused and rewritten during the VoxCPM2 port. That
+Apache-2.0 scope is limited to these helper families:
+
+- src/tokenizer.cpp: UTF-8 scanning, SentencePiece-style piece splitting,
+  byte-token fallback, and VoxCPM2 tokenizer merge application helpers.
+- src/synthesizer.cpp: ncnn tensor construction/extraction helpers, VoxCPM2 CFM
+  sampling glue, latent layout conversion, and RoPE cache construction.
+
+The Apache-2.0 text is retained in LICENSES/Apache-2.0.txt for that material.
+The Paged KV Cache is not derived from vLLM source code. It is an independent
+implementation of the paged/block-table idea and is released under MIT.
