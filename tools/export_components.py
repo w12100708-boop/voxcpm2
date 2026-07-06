@@ -7,8 +7,12 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
+import math
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pnnx
@@ -56,6 +60,22 @@ def sanitize_param(param_path: Path) -> None:
     text = param_path.read_text(encoding="utf-8", errors="replace")
     text = text.replace("F.scaled_dot_product_attention", "SDPA")
     param_path.write_text(text, encoding="utf-8")
+
+
+def rename_dit_sdpa_param(param_path: Path) -> None:
+    lines = param_path.read_text(encoding="utf-8").splitlines()
+    out: list[str] = []
+    fixed = 0
+    for line in lines:
+        fields = line.split()
+        if fields and fields[0] == "SDPA":
+            fields[0] = "VoxCPM2SDPA"
+            line = "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
+            fixed += 1
+        out.append(line)
+    if fixed == 0:
+        raise RuntimeError(f"no SDPA layer found in {param_path}")
+    param_path.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
 def fix_dit_prefix_param(param_path: Path) -> None:
@@ -114,6 +134,22 @@ def fix_dit_time_reshape_param(param_path: Path, expected: int = 3) -> None:
 
     if fixed != expected:
         raise RuntimeError(f"expected to fix {expected} DiT time reshape ops in {param_path}, fixed {fixed}")
+    param_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def fix_dit_batch_concat_axis_param(param_path: Path) -> None:
+    lines = param_path.read_text(encoding="utf-8").splitlines()
+    out: list[str] = []
+    fixed = 0
+    for line in lines:
+        fields = line.split()
+        if fields and fields[0] == "Concat" and fields[1] in {"cat_2", "cat_3", "cat_4"} and fields[-1] == "0=0":
+            fields[-1] = "0=1"
+            line = "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
+            fixed += 1
+        out.append(line)
+    if fixed != 3:
+        raise RuntimeError(f"expected to fix 3 DiT batch concat axes in {param_path}, fixed {fixed}")
     param_path.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
@@ -184,19 +220,19 @@ def add_sdpa_kvcache(param_path: Path) -> None:
 
 def run_pnnx(
     pt_path: Path,
-    inputs: tuple[torch.Tensor, ...],
+    inputshape: str,
     out_dir: Path,
     fp16: bool,
-    inputs2: tuple[torch.Tensor, ...] | None = None,
+    inputshape2: str | None = None,
 ) -> None:
     prefix = out_dir / pt_path.stem
     cmd = [
         pnnx.EXEC_PATH,
         str(pt_path),
-        f"inputshape={pnnx_inputshape(inputs)}",
+        f"inputshape={inputshape}",
     ]
-    if inputs2 is not None:
-        cmd.append(f"inputshape2={pnnx_inputshape(inputs2)}")
+    if inputshape2 is not None:
+        cmd.append(f"inputshape2={inputshape2}")
     cmd.extend(
         [
             "device=cpu",
@@ -223,14 +259,12 @@ def run_pnnx(
     sanitize_param(prefix.with_suffix(".ncnn.param"))
 
 
-def export_module(
+def trace_module(
     name: str,
     module: nn.Module,
     inputs: tuple[torch.Tensor, ...],
     out_dir: Path,
-    fp16: bool,
-    inputs2: tuple[torch.Tensor, ...] | None = None,
-) -> None:
+) -> Path:
     module = module.eval().to(torch.float32)
     out_dir.mkdir(parents=True, exist_ok=True)
     pt_path = out_dir / f"{name}.pt"
@@ -238,14 +272,29 @@ def export_module(
         module(*inputs)
         traced = torch.jit.trace(module, inputs, check_trace=False)
         traced.save(str(pt_path))
-    run_pnnx(pt_path, inputs, out_dir, fp16, inputs2)
+    return pt_path
+
+
+def postprocess_exported_param(name: str, out_dir: Path) -> None:
     if name == "dit_prefix":
         fix_dit_prefix_param(out_dir / f"{name}.ncnn.param")
         fix_dit_time_reshape_param(out_dir / f"{name}.ncnn.param")
     if name == "dit_estimator":
-        fix_dit_time_reshape_param(out_dir / f"{name}.ncnn.param")
+        rename_dit_sdpa_param(out_dir / f"{name}.ncnn.param")
     if name.endswith("_decoder_kv"):
         add_sdpa_kvcache(out_dir / f"{name}.ncnn.param")
+
+
+def cleanup_intermediates(name: str, out_dir: Path) -> None:
+    for path in [
+        out_dir / f"{name}.pt",
+        out_dir / f"{name}.pnnx.param",
+        out_dir / f"{name}.pnnx.bin",
+        out_dir / f"{name}_pnnx.py",
+        out_dir / f"{name}_ncnn.py",
+        out_dir / f"{name}.foldable_constants.zip",
+    ]:
+        path.unlink(missing_ok=True)
 
 
 class TextEmbed(nn.Module):
@@ -500,9 +549,89 @@ class DitEstimator(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.estimator = model.feat_decoder.estimator
+        half_dim = self.estimator.config.hidden_size // 2
+        scale = -math.log(10000) / (half_dim - 1)
+        freq = torch.exp(torch.arange(half_dim, dtype=torch.float32) * scale)
+        self.register_buffer("time_freq", freq, persistent=False)
+        self.register_buffer("dit_position_ids", torch.arange(0, 11, dtype=torch.long), persistent=False)
+
+    def time_embedding(self, sample: torch.Tensor) -> torch.Tensor:
+        sample = sample.reshape(sample.size(0), 1)
+        emb = 1000.0 * sample * self.time_freq.reshape(1, self.time_freq.numel())
+        return torch.cat((emb.sin(), emb.cos()), dim=-1)
+
+    def linear3(self, linear: nn.Linear, hidden: torch.Tensor) -> torch.Tensor:
+        return linear(hidden.reshape(-1, hidden.size(-1))).reshape(hidden.size(0), hidden.size(1), -1)
+
+    def mlp(self, mlp: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
+        gate = self.linear3(mlp.gate_proj, hidden)
+        up = self.linear3(mlp.up_proj, hidden)
+        return self.linear3(mlp.down_proj, mlp.act_fn(gate) * up)
+
+    def decoder(self, hidden: torch.Tensor) -> torch.Tensor:
+        position_emb = self.estimator.decoder.rope_emb(self.dit_position_ids)
+        for layer in self.estimator.decoder.layers:
+            residual = hidden
+            normed = layer.input_layernorm(hidden)
+            q = self.linear3(layer.self_attn.q_proj, normed)
+            k = self.linear3(layer.self_attn.k_proj, normed)
+            v = self.linear3(layer.self_attn.v_proj, normed)
+            q = q.reshape(hidden.size(0), hidden.size(1), layer.self_attn.num_heads, layer.self_attn.head_dim).transpose(1, 2)
+            k = k.reshape(hidden.size(0), hidden.size(1), layer.self_attn.num_key_value_heads, layer.self_attn.head_dim).transpose(1, 2)
+            v = v.reshape(hidden.size(0), hidden.size(1), layer.self_attn.num_key_value_heads, layer.self_attn.head_dim).transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, *position_emb)
+            attn = F.scaled_dot_product_attention(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                attn_mask=None,
+                is_causal=False,
+                enable_gqa=True,
+            )
+            attn = attn.transpose(1, 2).contiguous().reshape(hidden.size(0), hidden.size(1), layer.self_attn.num_heads * layer.self_attn.head_dim)
+            attn = self.linear3(layer.self_attn.o_proj, attn)
+            if layer.use_mup:
+                hidden = residual + attn * (layer.scale_depth / (layer.num_hidden_layers**0.5))
+            else:
+                hidden = residual + attn
+
+            residual = hidden
+            hidden = layer.post_attention_layernorm(hidden)
+            hidden = self.mlp(layer.mlp, hidden)
+            if layer.use_mup:
+                hidden = residual + hidden * (layer.scale_depth / (layer.num_hidden_layers**0.5))
+            else:
+                hidden = residual + hidden
+        return self.estimator.decoder.norm(hidden)
 
     def forward(self, x, mu, t, cond, dt):
-        out = self.estimator(x, mu, t, cond, dt)
+        batch = x.size(0)
+        x = x.transpose(1, 2).contiguous()
+        x = self.estimator.in_proj(x.reshape(-1, x.size(-1))).reshape(batch, -1, self.estimator.config.hidden_size)
+        cond = cond.transpose(1, 2).contiguous()
+        cond = self.estimator.cond_proj(cond.reshape(-1, cond.size(-1))).reshape(batch, -1, self.estimator.config.hidden_size)
+        prefix = cond.size(1)
+
+        t = self.estimator.time_mlp(self.time_embedding(t).to(x.dtype))
+        dt = self.estimator.delta_time_mlp(self.time_embedding(dt).to(x.dtype))
+        time_token = (t + dt).reshape(x.size(0), 1, x.size(-1))
+
+        hidden_size = x.size(-1)
+        mu = mu.reshape(-1, hidden_size)
+        time_token = time_token.reshape(-1, hidden_size)
+        cond = cond.reshape(-1, hidden_size)
+        x = x.reshape(-1, hidden_size)
+        hidden0 = torch.cat([mu[0:2, :], time_token[0:1, :]], dim=0)
+        hidden0 = torch.cat([hidden0, cond[0:4, :]], dim=0)
+        hidden0 = torch.cat([hidden0, x[0:4, :]], dim=0).reshape(1, 11, hidden_size)
+        hidden1 = torch.cat([mu[2:4, :], time_token[1:2, :]], dim=0)
+        hidden1 = torch.cat([hidden1, cond[4:8, :]], dim=0)
+        hidden1 = torch.cat([hidden1, x[4:8, :]], dim=0).reshape(1, 11, hidden_size)
+        hidden0 = self.decoder(hidden0).reshape(11, hidden_size)[7:11, :]
+        hidden1 = self.decoder(hidden1).reshape(11, hidden_size)[7:11, :]
+        hidden = torch.cat([hidden0, hidden1], dim=0)
+        out = self.estimator.out_proj(hidden).reshape(batch, 4, -1)
+        out = out.transpose(1, 2).contiguous()
         return out.reshape(out.size(0), -1)
 
 
@@ -677,11 +806,11 @@ def component_module(model, name: str, decoder_len: int, masked_decoder: bool) -
         return (
             DitEstimator(model),
             (
-                torch.randn(1, model.feat_dim, model.patch_size),
-                torch.randn(1, 2048),
-                torch.rand(1),
-                torch.randn(1, model.feat_dim, model.patch_size),
-                torch.zeros(1),
+                torch.randn(2, model.feat_dim, model.patch_size),
+                torch.randn(2, 2048),
+                torch.rand(2),
+                torch.randn(2, model.feat_dim, model.patch_size),
+                torch.zeros(2),
             ),
         )
     if name == "dit_prefix":
@@ -732,17 +861,26 @@ def update_manifest(asset_dir: Path, exported: list[str], decoder_len: int) -> N
     model_json = asset_dir / "model.json"
     manifest = json.loads(model_json.read_text(encoding="utf-8"))
     manifest["format_version"] = 2
-    params = manifest.setdefault("params", {})
-    for name in exported:
-        params[name] = {
+    current_params = manifest.get("params", {})
+    exported_set = set(exported)
+    allowed = [name for name in COMPONENTS if name in exported_set or name in current_params]
+    manifest["params"] = {
+        name: {
             "param": f"{name}.ncnn.param",
             "bin": f"{name}.ncnn.bin",
         }
-    missing = [name for name in manifest.get("missing_components", []) if name not in exported]
+        for name in allowed
+    }
+    missing = [name for name in COMPONENTS if name not in manifest["params"]]
     manifest["missing_components"] = missing
     setting = manifest.setdefault("setting", {})
     setting["decoder_context_length"] = decoder_len
     setting.setdefault("kv_head_cnt", 2)
+    manifest["tokenizer"] = {
+        "type": "voxcpm2_tokenizer_json",
+        "tokenizer_json": "tokenizer.json",
+        "split_multichar_cjk": True,
+    }
     model_json.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
@@ -752,7 +890,44 @@ def main() -> None:
     parser.add_argument("--asset-dir", type=Path, default=Path("assets/voxcpm2"))
     parser.add_argument("--components", nargs="+", default=COMPONENTS, choices=COMPONENT_CHOICES)
     parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--update-manifest", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--keep-intermediates", action="store_true")
+    parser.add_argument("--export-child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if not args.export_child:
+        args.asset_dir.mkdir(parents=True, exist_ok=True)
+        for name in args.components:
+            cmd = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--model-id",
+                args.model_id,
+                "--asset-dir",
+                str(args.asset_dir),
+                "--components",
+                name,
+                "--no-update-manifest",
+                "--export-child",
+            ]
+            if args.keep_intermediates:
+                cmd.append("--keep-intermediates")
+            cmd.append("--fp16" if args.fp16 else "--no-fp16")
+            env = os.environ.copy()
+            env.setdefault("OMP_NUM_THREADS", "1")
+            env.setdefault("MKL_NUM_THREADS", "1")
+            env.setdefault("OPENBLAS_NUM_THREADS", "1")
+            subprocess.run(cmd, check=True, env=env)
+
+        if args.update_manifest:
+            update_manifest(args.asset_dir, list(args.components), 4)
+            print(f"updated {args.asset_dir / 'model.json'}")
+        else:
+            print("skipped manifest update")
+        return
+
+    if len(args.components) != 1:
+        raise RuntimeError("--export-child expects exactly one component")
 
     pipeline = VoxCPM.from_pretrained(
         args.model_id,
@@ -769,11 +944,29 @@ def main() -> None:
     for name in args.components:
         print(f"exporting {name}", flush=True)
         module, inputs = component_module(model, name, 4, False)
-        export_module(name, module, inputs, args.asset_dir, args.fp16, component_shape2_inputs(model, name))
+        inputs2 = component_shape2_inputs(model, name)
+        inputshape = pnnx_inputshape(inputs)
+        inputshape2 = pnnx_inputshape(inputs2) if inputs2 is not None else None
+        pt_path = trace_module(name, module, inputs, args.asset_dir)
         exported.append(name)
 
-    update_manifest(args.asset_dir, exported, 4)
-    print(f"updated {args.asset_dir / 'model.json'}")
+        del inputs
+        del inputs2
+        del module
+        del model
+        del pipeline
+        gc.collect()
+
+        run_pnnx(pt_path, inputshape, args.asset_dir, args.fp16, inputshape2)
+        postprocess_exported_param(name, args.asset_dir)
+        if not args.keep_intermediates:
+            cleanup_intermediates(name, args.asset_dir)
+
+    if args.update_manifest:
+        update_manifest(args.asset_dir, exported, 4)
+        print(f"updated {args.asset_dir / 'model.json'}")
+    else:
+        print("skipped manifest update")
 
 
 if __name__ == "__main__":

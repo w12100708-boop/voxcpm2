@@ -8,6 +8,7 @@
 
 #include "helpers.h"
 #include "kvcache.h"
+#include "ncnn_layers/voxcpm2_sdpa.h"
 #include "progress.h"
 #ifdef VOXCPM2_ENABLE_PROFILE
 #include "profile.h"
@@ -94,38 +95,41 @@ std::vector<float> cfm_sample(ncnn::Net& dit_estimator,
         progress::current("dit_estimator", step, timesteps);
         std::vector<float> dphi(static_cast<std::size_t>(latent_size), 0.0f);
         if (step > zero_init_steps) {
-            std::vector<float> mu_positive(2048, 0.0f);
-            std::memcpy(mu_positive.data(), mu.data(), std::min<std::size_t>(mu.size(), 2048) * sizeof(float));
-            std::vector<float> mu_negative(2048, 0.0f);
-            const std::vector<float> t_in = {t};
-            const std::vector<float> dt_in = {0.0f};
+            std::vector<float> x_in(static_cast<std::size_t>(latent_size) * 2);
+            std::memcpy(x_in.data(), x.data(), static_cast<std::size_t>(latent_size) * sizeof(float));
+            std::memcpy(x_in.data() + latent_size, x.data(), static_cast<std::size_t>(latent_size) * sizeof(float));
 
-            auto run_dit = [&](const std::vector<float>& hidden_mu) {
-                return run_net_vec(
-                    dit_estimator,
-                    {
-                        make_f32_mat(patch_size, feat_dim, x),
-                        make_f32_mat(2048, 1, hidden_mu),
-                        make_f32_mat(1, 1, t_in),
-                        make_f32_mat(patch_size, feat_dim, cond),
-                        make_f32_mat(1, 1, dt_in),
-                    });
-            };
+            std::vector<float> mu_in(4096, 0.0f);
+            std::memcpy(mu_in.data(), mu.data(), std::min<std::size_t>(mu.size(), 2048) * sizeof(float));
 
-            const std::vector<float> positive = run_dit(mu_positive);
-            const std::vector<float> negative = run_dit(mu_negative);
-            if (static_cast<int>(positive.size()) != latent_size or static_cast<int>(negative.size()) != latent_size) [[unlikely]] {
+            std::vector<float> cond_in(static_cast<std::size_t>(latent_size) * 2);
+            std::memcpy(cond_in.data(), cond.data(), static_cast<std::size_t>(latent_size) * sizeof(float));
+            std::memcpy(cond_in.data() + latent_size, cond.data(), static_cast<std::size_t>(latent_size) * sizeof(float));
+
+            const std::vector<float> t_in = {t, t};
+            const std::vector<float> dt_in = {0.0f, 0.0f};
+            const std::vector<float> estimator_out = run_net_vec(
+                dit_estimator,
+                {
+                    make_f32_mat(patch_size, feat_dim, 2, x_in),
+                    make_f32_mat(2048, 2, mu_in),
+                    make_f32_input(t_in),
+                    make_f32_mat(patch_size, feat_dim, 2, cond_in),
+                    make_f32_input(dt_in),
+                });
+            if (static_cast<int>(estimator_out.size()) != latent_size * 2) [[unlikely]] {
                 throw std::runtime_error("dit_estimator output size mismatch");
             }
-            if (not std::ranges::all_of(positive, [](float v) { return std::isfinite(v); }) or
-                not std::ranges::all_of(negative, [](float v) { return std::isfinite(v); })) [[unlikely]] {
+            if (not std::ranges::all_of(estimator_out, [](float v) { return std::isfinite(v); })) [[unlikely]] {
                 throw std::runtime_error("dit_estimator produced non-finite values");
             }
-            const float scale = optimized_scale(positive.data(), negative.data(), latent_size);
+            const float* positive = estimator_out.data();
+            const float* negative = estimator_out.data() + latent_size;
+            const float scale = optimized_scale(positive, negative, latent_size);
             for (int i = 0; i < latent_size; ++i) {
                 dphi[static_cast<std::size_t>(i)] =
-                    negative[static_cast<std::size_t>(i)] * scale +
-                    cfg_value * (positive[static_cast<std::size_t>(i)] - negative[static_cast<std::size_t>(i)] * scale);
+                    negative[i] * scale +
+                    cfg_value * (positive[i] - negative[i] * scale);
             }
         }
 
@@ -601,11 +605,11 @@ public:
             run_net(
                 net("dit_estimator"),
                 {
-                    make_f32_input(patch_size_, feat_dim_),
-                    make_f32_input(hidden_size_, 1),
-                    make_f32_input(1, 1),
-                    make_f32_input(patch_size_, feat_dim_),
-                    make_f32_input(1, 1),
+                    make_f32_input(patch_size_, feat_dim_, 2),
+                    make_f32_input(hidden_size_, 2),
+                    make_f32_input(2, 1),
+                    make_f32_input(patch_size_, feat_dim_, 2),
+                    make_f32_input(2, 1),
                 }));
         print_mat_shape("stop_head", run_single_input(net("stop_head"), make_f32_input(hidden_size_, 1)));
         print_mat_shape("audio_vae_encoder", run_single_input(net("audio_vae_encoder"), make_f32_input(patch_size_ * chunk_size_ * 2, 1)));
@@ -737,6 +741,9 @@ private:
             net_ptr->set_vulkan_device(vulkan_device_);
         }
 #endif
+        if (name == "dit_estimator") {
+            register_voxcpm2_sdpa(*net_ptr);
+        }
         if (net_ptr->load_param((model_dir_ / param_file).string().c_str()) != 0) [[unlikely]] {
             throw std::runtime_error("failed to load param for " + name);
         }
@@ -841,19 +848,22 @@ private:
         ncnn::Option opt;
         opt.num_threads = threads_;
         opt.use_bf16_storage = false;
-        opt.use_fp16_storage = false;
-        opt.use_fp16_packed = false;
-        opt.use_fp16_arithmetic = false;
+        opt.use_bf16_packed = false;
+        opt.use_fp16_storage = true;
+        opt.use_fp16_packed = true;
+        opt.use_fp16_arithmetic = true;
+        opt.use_int8_inference = false;
         opt.use_int8_storage = false;
         opt.use_int8_packed = false;
         opt.use_int8_arithmetic = false;
         opt.use_vulkan_compute = use_vulkan_;
-        // if (name == "text_embed") {
-        //     opt.use_vulkan_compute = false;
-        // }
-        if (name == "dit_estimator") {
-            opt.use_packing_layout = false;
+        if (name == "base_decoder_kv" or name == "residual_decoder_kv" or name == "feat_encoder" or name == "dit_estimator") {
+            // These graphs use fp16 weights, but fp16 Vulkan storage/packing is
+            // numerically unstable for the current exported shapes.
+            opt.use_fp16_storage = false;
+            opt.use_fp16_packed = false;
         }
+        (void)name;
         return opt;
     }
 

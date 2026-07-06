@@ -20,6 +20,7 @@ namespace voxcpm2::runtime {
 
 inline ncnn::Mat make_i64_input(int w, int h) {
     ncnn::Mat mat(w, h, std::size_t{8});
+    std::memset(mat.data, 0, mat.total() * mat.elemsize);
     auto* p = static_cast<long long*>(mat.data);
     for (int i = 0; i < w * h; ++i) {
         p[i] = (i % 2 == 0) ? 1 : 0;
@@ -30,6 +31,13 @@ inline ncnn::Mat make_i64_input(int w, int h) {
 inline ncnn::Mat make_i32_input(const std::vector<int>& values) {
     ncnn::Mat mat(static_cast<int>(values.size()));
     std::memcpy(mat.data, values.data(), values.size() * sizeof(int));
+    return mat;
+}
+
+inline ncnn::Mat make_f32_input(const std::vector<float>& values) {
+    ncnn::Mat mat(static_cast<int>(values.size()));
+    std::memset(mat.data, 0, mat.total() * mat.elemsize);
+    std::memcpy(mat.data, values.data(), values.size() * sizeof(float));
     return mat;
 }
 
@@ -47,6 +55,17 @@ inline ncnn::Mat make_f32_mat(int w, int h, const std::vector<float>& values) {
         throw std::runtime_error("make_f32_mat size mismatch");
     }
     ncnn::Mat mat(w, h);
+    std::memset(mat.data, 0, mat.total() * mat.elemsize);
+    std::memcpy(mat.data, values.data(), values.size() * sizeof(float));
+    return mat;
+}
+
+inline ncnn::Mat make_f32_mat(int w, int h, int c, const std::vector<float>& values) {
+    if (static_cast<int>(values.size()) != w * h * c) [[unlikely]] {
+        throw std::runtime_error("make_f32_mat size mismatch");
+    }
+    ncnn::Mat mat(w, h, c);
+    std::memset(mat.data, 0, mat.total() * mat.elemsize);
     std::memcpy(mat.data, values.data(), values.size() * sizeof(float));
     return mat;
 }
@@ -54,6 +73,25 @@ inline ncnn::Mat make_f32_mat(int w, int h, const std::vector<float>& values) {
 inline std::vector<float> mat_to_vector(const ncnn::Mat& mat) {
     if (mat.elemsize != 4) [[unlikely]] {
         throw std::runtime_error("expected f32 ncnn::Mat");
+    }
+    if (mat.dims == 1) {
+        std::vector<float> values(static_cast<std::size_t>(mat.w));
+        std::memcpy(values.data(), mat.data, values.size() * sizeof(float));
+        return values;
+    }
+    if (mat.dims == 2) {
+        std::vector<float> values(static_cast<std::size_t>(mat.w) * mat.h);
+        std::memcpy(values.data(), mat.data, values.size() * sizeof(float));
+        return values;
+    }
+    if (mat.dims == 3) {
+        const std::size_t plane = static_cast<std::size_t>(mat.w) * mat.h;
+        std::vector<float> values(plane * mat.c);
+        for (int q = 0; q < mat.c; ++q) {
+            const float* src = mat.channel(q);
+            std::memcpy(values.data() + plane * q, src, plane * sizeof(float));
+        }
+        return values;
     }
     std::vector<float> values(mat.total());
     std::memcpy(values.data(), mat.data, values.size() * sizeof(float));

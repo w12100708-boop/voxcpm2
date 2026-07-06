@@ -12,3 +12,9 @@ Apache-2.0 scope is limited to these helper families:
   sampling glue, latent layout conversion, and RoPE cache construction.
 
 The Apache-2.0 text is retained in LICENSES/Apache-2.0.txt for that material.
+
+The local VoxCPM2 SDPA custom layer and embedded Vulkan shaders under
+src/ncnn_layers are derived from BSD-3-Clause licensed ncnn SDPA Vulkan layer
+and shader code, with local changes for VoxCPM2 graph names, shader embedding,
+and runtime integration. The BSD-3-Clause text is retained in
+LICENSES/BSD-3-Clause.txt for that material.
