@@ -12,5 +12,3 @@ Apache-2.0 scope is limited to these helper families:
   sampling glue, latent layout conversion, and RoPE cache construction.
 
 The Apache-2.0 text is retained in LICENSES/Apache-2.0.txt for that material.
-The Paged KV Cache is not derived from vLLM source code. It is an independent
-implementation of the paged/block-table idea and is released under MIT.

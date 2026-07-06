@@ -16,6 +16,7 @@ xmake build voxcpm2
 Model assets are not committed to this repository. Put the exported VoxCPM2 ncnn assets under `assets/voxcpm2`, or point `-m/--model` at another directory.
 
 Prebuilt ncnn assets are published at <https://huggingface.co/lyrin/voxpm2-ncnn>.
+The current runtime requires `model.json` `format_version >= 2`, exported with `base_decoder_kv` and `residual_decoder_kv`; older `base_decoder_step` / `residual_decoder_step` assets must be re-exported.
 
 ```sh
 huggingface-cli download lyrin/voxpm2-ncnn --local-dir assets
@@ -60,6 +61,14 @@ xmake run voxcpm2 -m assets/voxcpm2 --smoke-components
 xmake run voxcpm2 -m assets/voxcpm2 --smoke-components --vulkan
 ```
 
+Print coarse runtime timings by enabling the optional profile build:
+
+```sh
+xmake f --profile=true
+xmake build voxcpm2
+xmake run voxcpm2 -m assets/voxcpm2 -t "你好，欢迎使用 VoxCPM2。" --profile -o out.wav
+```
+
 Output format is inferred by FFmpeg from `-o/--output`. The CLI does not expose a max generation length; normal synthesis stops through the exported stop token head, with an internal runaway cap.
 
 ## Tests
@@ -75,8 +84,7 @@ The public C++ API lives under `include/voxcpm2`:
 - `voxcpm2::Tokenizer` exposes `encode(text)`.
 - `voxcpm2::Synthesizer` loads the ncnn asset directory and returns `AudioBuffer`.
 - `voxcpm2::read_audio_file` and `voxcpm2::write_audio_file` handle FFmpeg audio I/O.
-- `voxcpm2::PagedKvCache` provides a page/block-table KV cache for the current ncnn decoder-step graphs.
 
 ## License
 
-This project is released primarily under the MIT license in `LICENSE`. A small Apache-2.0 derivative scope is retained only for reused and rewritten `ncnn_llm` helper code described in `NOTICE`; the Apache-2.0 text is in `LICENSES/Apache-2.0.txt`. The Paged KV Cache is an independent implementation inspired by vLLM's design, not derived from vLLM source.
+This project is released primarily under the MIT license in `LICENSE`. A small Apache-2.0 derivative scope is retained only for reused and rewritten `ncnn_llm` helper code described in `NOTICE`; the Apache-2.0 text is in `LICENSES/Apache-2.0.txt`.

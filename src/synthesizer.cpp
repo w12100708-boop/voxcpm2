@@ -6,8 +6,12 @@
 
 #include "voxcpm2/synthesizer.h"
 
+#include "helpers.h"
+#include "kvcache.h"
 #include "progress.h"
-#include "voxcpm2/paged_kv_cache.h"
+#ifdef VOXCPM2_ENABLE_PROFILE
+#include "profile.h"
+#endif
 #include "voxcpm2/tokenizer.h"
 
 #include <algorithm>
@@ -20,7 +24,6 @@
 #include <memory>
 #include <numbers>
 #include <numeric>
-#include <print>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -35,167 +38,13 @@ namespace voxcpm2 {
 namespace {
 
 using json = nlohmann::json;
+using namespace runtime;
 
 struct PrefixRow {
     int token_id = 0;
     bool is_audio = false;
     std::vector<float> audio_latent_d_p;
 };
-
-ncnn::Mat make_i64_input(int w, int h) {
-    ncnn::Mat mat(w, h, std::size_t{8});
-    auto* p = static_cast<long long*>(mat.data);
-    for (int i = 0; i < w * h; ++i) {
-        p[i] = (i % 2 == 0) ? 1 : 0;
-    }
-    return mat;
-}
-
-ncnn::Mat make_i32_input(const std::vector<int>& values) {
-    ncnn::Mat mat(static_cast<int>(values.size()));
-    std::memcpy(mat.data, values.data(), values.size() * sizeof(int));
-    return mat;
-}
-
-ncnn::Mat make_f32_input(int w, int h, int c = 1) {
-    ncnn::Mat mat = c == 1 ? ncnn::Mat(w, h) : ncnn::Mat(w, h, c);
-    auto* p = static_cast<float*>(mat.data);
-    for (int i = 0; i < mat.total(); ++i) {
-        p[i] = static_cast<float>((i % 17) - 8) / 32.0f;
-    }
-    return mat;
-}
-
-ncnn::Mat make_f32_input1d(int w) {
-    ncnn::Mat mat(w);
-    auto* p = static_cast<float*>(mat.data);
-    for (int i = 0; i < mat.total(); ++i) {
-        p[i] = static_cast<float>((i % 17) - 8) / 32.0f;
-    }
-    return mat;
-}
-
-ncnn::Mat make_f32_mat(int w, int h, const std::vector<float>& values) {
-    if (static_cast<int>(values.size()) != w * h) [[unlikely]] {
-        throw std::runtime_error("make_f32_mat size mismatch");
-    }
-    ncnn::Mat mat(w, h);
-    std::memcpy(mat.data, values.data(), values.size() * sizeof(float));
-    return mat;
-}
-
-ncnn::Mat make_f32_vec(const std::vector<float>& values) {
-    ncnn::Mat mat(static_cast<int>(values.size()));
-    std::memcpy(mat.data, values.data(), values.size() * sizeof(float));
-    return mat;
-}
-
-ncnn::Mat make_step_mask(int context_len) {
-    ncnn::Mat mat(context_len);
-    mat.fill(0.0f);
-    return mat;
-}
-
-std::vector<float> mat_to_vector(const ncnn::Mat& mat) {
-    if (mat.elemsize != 4) [[unlikely]] {
-        throw std::runtime_error("expected f32 ncnn::Mat");
-    }
-    std::vector<float> values(mat.total());
-    std::memcpy(values.data(), mat.data, values.size() * sizeof(float));
-    return values;
-}
-
-void print_mat_shape(const std::string& name, const ncnn::Mat& mat) {
-    if (mat.empty()) {
-        std::println(stderr, "{}: empty", name);
-        return;
-    }
-    std::println(
-        stderr,
-        "{}: dims={} w={} h={} c={} total={} elemsize={}",
-        name,
-        mat.dims,
-        mat.w,
-        mat.h,
-        mat.c,
-        mat.total(),
-        mat.elemsize);
-}
-
-ncnn::Mat run_single_input(ncnn::Net& net, const ncnn::Mat& in) {
-    ncnn::Extractor ex = net.create_extractor();
-    ex.input("in0", in);
-    ncnn::Mat out;
-    if (ex.extract("out0", out) != 0 or out.empty()) [[unlikely]] {
-        throw std::runtime_error("failed to extract out0");
-    }
-    return out;
-}
-
-ncnn::Mat run_net(ncnn::Net& net, const std::vector<ncnn::Mat>& inputs) {
-    ncnn::Extractor ex = net.create_extractor();
-    for (std::size_t i = 0; i < inputs.size(); ++i) {
-        const std::string name = std::format("in{}", i);
-        ex.input(name.c_str(), inputs[i]);
-    }
-    ncnn::Mat out;
-    if (ex.extract("out0", out) != 0 or out.empty()) [[unlikely]] {
-        throw std::runtime_error("failed to extract out0");
-    }
-    return out;
-}
-
-std::vector<float> run_net_vec(ncnn::Net& net, const std::vector<ncnn::Mat>& inputs) {
-    return mat_to_vector(run_net(net, inputs));
-}
-
-ncnn::Mat run_decoder_step_with_kv(ncnn::Net& net,
-                                   const ncnn::Mat& embed,
-                                   const ncnn::Mat& mask,
-                                   const ncnn::Mat* cos_cache,
-                                   const ncnn::Mat* sin_cache,
-                                   PagedKvCache& kv_cache,
-                                   int attn_count) {
-    if (kv_cache.layer_count() != attn_count) [[unlikely]] {
-        throw std::runtime_error("paged kv cache layer count mismatch");
-    }
-
-    ncnn::Extractor ex = net.create_extractor();
-    ex.input("in0", embed);
-    ex.input("in1", mask);
-    if (cos_cache != nullptr and sin_cache != nullptr) {
-        ex.input("in2", *cos_cache);
-        ex.input("in3", *sin_cache);
-    }
-
-    std::vector<KvCachePair> materialized;
-    materialized.reserve(static_cast<std::size_t>(attn_count));
-    for (int i = 0; i < attn_count; ++i) {
-        materialized.push_back(kv_cache.materialize(i));
-        const std::string k_name = std::format("cache_k{}", i);
-        const std::string v_name = std::format("cache_v{}", i);
-        ex.input(k_name.c_str(), materialized.back().key);
-        ex.input(v_name.c_str(), materialized.back().value);
-    }
-
-    for (int i = 0; i < attn_count; ++i) {
-        const std::string k_name = std::format("out_cache_k{}", i);
-        const std::string v_name = std::format("out_cache_v{}", i);
-        ncnn::Mat k_cache;
-        ncnn::Mat v_cache;
-        if (ex.extract(k_name.c_str(), k_cache) != 0 or k_cache.empty() or
-            ex.extract(v_name.c_str(), v_cache) != 0 or v_cache.empty()) [[unlikely]] {
-            throw std::runtime_error("failed to extract decoder step kv cache");
-        }
-        kv_cache.append_from_contiguous(i, k_cache, v_cache);
-    }
-
-    ncnn::Mat out;
-    if (ex.extract("out0", out) != 0 or out.empty()) [[unlikely]] {
-        throw std::runtime_error("failed to extract decoder step out0");
-    }
-    return out;
-}
 
 std::vector<float> row_slice(const std::vector<float>& mat, int row, int width) {
     std::vector<float> out(static_cast<std::size_t>(width));
@@ -360,6 +209,9 @@ public:
     explicit Impl(SynthesizerConfig config)
         : model_dir_(std::move(config.model_dir)),
           use_vulkan_(config.use_vulkan),
+#ifdef VOXCPM2_ENABLE_PROFILE
+          profile_(config.profile),
+#endif
           threads_(config.threads > 0 ? config.threads : 4),
           vulkan_device_(config.vulkan_device) {
 #if NCNN_VULKAN
@@ -381,6 +233,9 @@ public:
     }
 
     AudioBuffer generate(const SynthesisOptions& options) const {
+#ifdef VOXCPM2_ENABLE_PROFILE
+        ProfileSpan profile(profile_);
+#endif
         if (options.text.empty()) [[unlikely]] {
             throw std::runtime_error("text must not be empty");
         }
@@ -433,6 +288,9 @@ public:
             append_text_tokens(target_ids);
             prefix.push_back(PrefixRow{.token_id = audio_start_token_, .is_audio = false, .audio_latent_d_p = {}});
         }
+#ifdef VOXCPM2_ENABLE_PROFILE
+        profile.mark("build_prefix");
+#endif
 
         std::vector<int> token_ids;
         token_ids.reserve(prefix.size());
@@ -441,90 +299,134 @@ public:
         }
 
         const int prefix_len = static_cast<int>(prefix.size());
-        progress::begin_phase(progress::Phase::prefix, "prefix", prefix_len + 1);
+        progress::begin_phase(progress::Phase::prefix, "prefix", 4);
         progress::current("text_embed", 1, 1);
         std::vector<float> text_embed = run_net_vec(net("text_embed"), {make_i32_input(token_ids)});
         if (static_cast<int>(text_embed.size()) != prefix_len * hidden_size_) [[unlikely]] {
             throw std::runtime_error("text_embed output size mismatch");
         }
         progress::advance_phase("text_embed");
+#ifdef VOXCPM2_ENABLE_PROFILE
+        profile.mark("text_embed");
+#endif
 
         std::vector<std::vector<float>> feat_embeds(static_cast<std::size_t>(prefix_len),
                                                     std::vector<float>(hidden_size_, 0.0f));
+        std::vector<float> zero_embed(hidden_size_, 0.0f);
+        std::vector<float> combined_embed(static_cast<std::size_t>(prefix_len) * hidden_size_, 0.0f);
+        std::vector<float> residual_feat_embed(static_cast<std::size_t>(prefix_len) * hidden_size_, 0.0f);
+        std::vector<int> audio_mask(static_cast<std::size_t>(prefix_len), 0);
+        std::vector<float> prefix_feat_cond = zero_latent_d_p(feat_dim_, patch_size_);
         for (int i = 0; i < prefix_len; ++i) {
-            if (not prefix[static_cast<std::size_t>(i)].is_audio) {
-                continue;
+            const PrefixRow& row = prefix[static_cast<std::size_t>(i)];
+            std::vector<float> row_embed;
+            if (row.is_audio) {
+                audio_mask[static_cast<std::size_t>(i)] = 1;
+                progress::current("feat_encoder", i + 1, prefix_len);
+                const std::vector<float> feat_input = transpose_d_p_to_p_d(row.audio_latent_d_p, feat_dim_, patch_size_);
+                feat_embeds[static_cast<std::size_t>(i)] =
+                    run_net_vec(net("feat_encoder"), {make_f32_mat(feat_dim_, patch_size_, feat_input)});
+                if (static_cast<int>(feat_embeds[static_cast<std::size_t>(i)].size()) != hidden_size_) [[unlikely]] {
+                    throw std::runtime_error("feat_encoder output size mismatch");
+                }
+                row_embed = feat_embeds[static_cast<std::size_t>(i)];
+                prefix_feat_cond = row.audio_latent_d_p;
+            } else {
+                row_embed = row_slice(text_embed, i, hidden_size_);
+                prefix_feat_cond = zero_latent_d_p(feat_dim_, patch_size_);
             }
-            progress::current("feat_encoder", i + 1, prefix_len);
-            const std::vector<float> feat_input =
-                transpose_d_p_to_p_d(prefix[static_cast<std::size_t>(i)].audio_latent_d_p, feat_dim_, patch_size_);
-            feat_embeds[static_cast<std::size_t>(i)] =
-                run_net_vec(net("feat_encoder"), {make_f32_mat(feat_dim_, patch_size_, feat_input)});
-            if (static_cast<int>(feat_embeds[static_cast<std::size_t>(i)].size()) != hidden_size_) [[unlikely]] {
-                throw std::runtime_error("feat_encoder output size mismatch");
+            std::memcpy(
+                combined_embed.data() + static_cast<std::size_t>(i) * hidden_size_,
+                row_embed.data(),
+                static_cast<std::size_t>(hidden_size_) * sizeof(float));
+            if (row.is_audio) {
+                std::memcpy(
+                    residual_feat_embed.data() + static_cast<std::size_t>(i) * hidden_size_,
+                    feat_embeds[static_cast<std::size_t>(i)].data(),
+                    static_cast<std::size_t>(hidden_size_) * sizeof(float));
             }
         }
+#ifdef VOXCPM2_ENABLE_PROFILE
+        profile.mark("prefix_feat_embed");
+#endif
 
         const int max_patches = max_patches_for_target(target_text_token_count, max_generation_patches_);
         std::vector<std::vector<float>> patch_latents;
         patch_latents.reserve(static_cast<std::size_t>(max_patches));
         std::mt19937 rng(0);
-        PagedKvCache base_cache(base_attn_count_);
-        PagedKvCache residual_cache(residual_attn_count_);
-        std::vector<float> zero_embed(hidden_size_, 0.0f);
-        std::vector<float> prefix_feat_cond = zero_latent_d_p(feat_dim_, patch_size_);
-        std::vector<float> current_lm_hidden;
-        std::vector<float> current_residual_hidden;
+        DecoderKvCache base_cache(base_attn_count_, rope_head_dim_, kv_head_count_);
+        DecoderKvCache residual_cache(residual_attn_count_, rope_head_dim_, kv_head_count_);
 
-        for (int pos = 0; pos < prefix_len; ++pos) {
-            const PrefixRow& row = prefix[static_cast<std::size_t>(pos)];
-            std::vector<float> embed = row.is_audio ? feat_embeds[static_cast<std::size_t>(pos)]
-                                                     : row_slice(text_embed, pos, hidden_size_);
-            ncnn::Mat cos_cache;
-            ncnn::Mat sin_cache;
-            make_rope_cache(pos, cos_cache, sin_cache);
-            progress::current("base_decoder_step", pos + 1, prefix_len);
-            ncnn::Mat base_out = run_decoder_step_with_kv(
-                net("base_decoder_step"),
-                make_f32_vec(embed),
-                make_step_mask(pos + 1),
-                &cos_cache,
-                &sin_cache,
-                base_cache,
-                base_attn_count_);
-            current_lm_hidden = mat_to_vector(base_out);
-            if (static_cast<int>(current_lm_hidden.size()) != hidden_size_) [[unlikely]] {
-                throw std::runtime_error("base_decoder_step output size mismatch");
-            }
-            if (row.is_audio) {
-                current_lm_hidden = run_net_vec(net("fsq"), {make_f32_mat(hidden_size_, 1, current_lm_hidden)});
-                prefix_feat_cond = row.audio_latent_d_p;
-            } else {
-                prefix_feat_cond = zero_latent_d_p(feat_dim_, patch_size_);
-            }
+        ncnn::Mat prefix_cos_cache;
+        ncnn::Mat prefix_sin_cache;
+        make_rope_cache(0, prefix_len, prefix_cos_cache, prefix_sin_cache);
 
-            progress::current("fusion_proj", pos + 1, prefix_len);
-            std::vector<float> residual_input = run_net_vec(
-                net("fusion_proj"),
-                {
-                    make_f32_mat(hidden_size_, 1, current_lm_hidden),
-                    make_f32_mat(hidden_size_, 1, row.is_audio ? feat_embeds[static_cast<std::size_t>(pos)] : zero_embed),
-                });
-            progress::current("residual_decoder_step", pos + 1, prefix_len);
-            ncnn::Mat residual_out = run_decoder_step_with_kv(
-                net("residual_decoder_step"),
-                make_f32_vec(residual_input),
-                make_step_mask(pos + 1),
-                nullptr,
-                nullptr,
-                residual_cache,
-                residual_attn_count_);
-            current_residual_hidden = mat_to_vector(residual_out);
-            if (static_cast<int>(current_residual_hidden.size()) != hidden_size_) [[unlikely]] {
-                throw std::runtime_error("residual_decoder_step output size mismatch");
-            }
-            progress::advance_phase("prefix");
+        progress::current("base_decoder_kv", 1, 2);
+        ncnn::Mat base_prefill = run_decoder_with_kv(
+            net("base_decoder_kv"),
+            make_f32_mat(hidden_size_, prefix_len, combined_embed),
+            make_decoder_mask(prefix_len, 0),
+            &prefix_cos_cache,
+            &prefix_sin_cache,
+            base_cache,
+            base_attn_count_);
+        std::vector<float> base_hidden = mat_to_vector(base_prefill);
+        if (static_cast<int>(base_hidden.size()) != prefix_len * hidden_size_) [[unlikely]] {
+            throw std::runtime_error("base_decoder_kv prefill output size mismatch");
         }
+#ifdef VOXCPM2_ENABLE_PROFILE
+        profile.mark("base_prefill");
+#endif
+
+        std::vector<float> fsq_hidden = run_net_vec(net("fsq"), {make_f32_mat(hidden_size_, prefix_len, base_hidden)});
+        if (static_cast<int>(fsq_hidden.size()) != prefix_len * hidden_size_) [[unlikely]] {
+            throw std::runtime_error("fsq prefix output size mismatch");
+        }
+        std::vector<float> lm_prefix_hidden = base_hidden;
+        for (int row = 0; row < prefix_len; ++row) {
+            if (audio_mask[static_cast<std::size_t>(row)] == 0) {
+                continue;
+            }
+            std::memcpy(
+                lm_prefix_hidden.data() + static_cast<std::size_t>(row) * hidden_size_,
+                fsq_hidden.data() + static_cast<std::size_t>(row) * hidden_size_,
+                static_cast<std::size_t>(hidden_size_) * sizeof(float));
+        }
+
+        progress::current("fusion_proj", 1, 1);
+        std::vector<float> residual_inputs = run_net_vec(
+            net("fusion_proj"),
+            {
+                make_f32_mat(hidden_size_, prefix_len, lm_prefix_hidden),
+                make_f32_mat(hidden_size_, prefix_len, residual_feat_embed),
+            });
+        if (static_cast<int>(residual_inputs.size()) != prefix_len * hidden_size_) [[unlikely]] {
+            throw std::runtime_error("fusion_proj prefix output size mismatch");
+        }
+#ifdef VOXCPM2_ENABLE_PROFILE
+        profile.mark("prefix_fsq_fusion");
+#endif
+
+        progress::current("residual_decoder_kv", 2, 2);
+        ncnn::Mat residual_prefill = run_decoder_with_kv(
+            net("residual_decoder_kv"),
+            make_f32_mat(hidden_size_, prefix_len, residual_inputs),
+            make_decoder_mask(prefix_len, 0),
+            nullptr,
+            nullptr,
+            residual_cache,
+            residual_attn_count_);
+        std::vector<float> residual_hidden = mat_to_vector(residual_prefill);
+        if (static_cast<int>(residual_hidden.size()) != prefix_len * hidden_size_) [[unlikely]] {
+            throw std::runtime_error("residual_decoder_kv prefill output size mismatch");
+        }
+#ifdef VOXCPM2_ENABLE_PROFILE
+        profile.mark("residual_prefill");
+#endif
+
+        std::vector<float> current_lm_hidden = row_slice(lm_prefix_hidden, prefix_len - 1, hidden_size_);
+        std::vector<float> current_residual_hidden = row_slice(residual_hidden, prefix_len - 1, hidden_size_);
+        progress::advance_phase("prefix");
         progress::finish_phase("prefix");
 
         progress::begin_phase(progress::Phase::generation, "generation", max_patches);
@@ -559,6 +461,9 @@ public:
                 rng);
             patch_latents.push_back(latent);
             prefix_feat_cond = latent;
+#ifdef VOXCPM2_ENABLE_PROFILE
+            profile.mark(std::format("generation_patch_{}", step + 1));
+#endif
 
             const std::vector<float> stop_logits =
                 run_net_vec(net("stop_head"), {make_f32_mat(hidden_size_, 1, current_lm_hidden)});
@@ -578,18 +483,18 @@ public:
             ncnn::Mat cos_cache;
             ncnn::Mat sin_cache;
             make_rope_cache(patch_pos, cos_cache, sin_cache);
-            progress::current("base_decoder_step", step + 1, max_patches);
-            ncnn::Mat base_out = run_decoder_step_with_kv(
-                net("base_decoder_step"),
-                make_f32_vec(feat_embed),
-                make_step_mask(patch_pos + 1),
+            progress::current("base_decoder_kv", step + 1, max_patches);
+            ncnn::Mat base_out = run_decoder_with_kv(
+                net("base_decoder_kv"),
+                make_f32_mat(hidden_size_, 1, feat_embed),
+                make_decoder_mask(1, base_cache.token_count()),
                 &cos_cache,
                 &sin_cache,
                 base_cache,
                 base_attn_count_);
             current_lm_hidden = mat_to_vector(base_out);
             if (static_cast<int>(current_lm_hidden.size()) != hidden_size_) [[unlikely]] {
-                throw std::runtime_error("base_decoder_step output size mismatch");
+                throw std::runtime_error("base_decoder_kv output size mismatch");
             }
 
             progress::current("fsq", step + 1, max_patches);
@@ -602,21 +507,24 @@ public:
                     make_f32_mat(hidden_size_, 1, processed),
                     make_f32_mat(hidden_size_, 1, feat_embed),
                 });
-            progress::current("residual_decoder_step", step + 1, max_patches);
-            ncnn::Mat residual_out = run_decoder_step_with_kv(
-                net("residual_decoder_step"),
-                make_f32_vec(residual_input),
-                make_step_mask(patch_pos + 1),
+            progress::current("residual_decoder_kv", step + 1, max_patches);
+            ncnn::Mat residual_out = run_decoder_with_kv(
+                net("residual_decoder_kv"),
+                make_f32_mat(hidden_size_, 1, residual_input),
+                make_decoder_mask(1, residual_cache.token_count()),
                 nullptr,
                 nullptr,
                 residual_cache,
                 residual_attn_count_);
             current_residual_hidden = mat_to_vector(residual_out);
             if (static_cast<int>(current_residual_hidden.size()) != hidden_size_) [[unlikely]] {
-                throw std::runtime_error("residual_decoder_step output size mismatch");
+                throw std::runtime_error("residual_decoder_kv output size mismatch");
             }
         }
         progress::finish_phase("generation");
+#ifdef VOXCPM2_ENABLE_PROFILE
+        profile.mark("generation");
+#endif
 
         std::vector<float> vae_latent = build_vae_latent(patch_latents, latent_dim_, patch_size_);
         progress::begin_phase(progress::Phase::decode, "decode", 1);
@@ -626,6 +534,9 @@ public:
             {make_f32_mat(static_cast<int>(patch_latents.size()) * patch_size_, latent_dim_, vae_latent)});
         progress::advance_phase("audio_vae_decoder");
         progress::finish_phase("decode");
+#ifdef VOXCPM2_ENABLE_PROFILE
+        profile.mark("decode");
+#endif
         return AudioBuffer{.sample_rate = out_sample_rate_, .channels = 1, .samples = std::move(samples)};
     }
 
@@ -641,33 +552,41 @@ public:
 
         print_mat_shape("text_embed", run_single_input(net("text_embed"), make_i64_input(4, 1)));
         {
-            PagedKvCache cache(base_attn_count_);
+            DecoderKvCache cache(base_attn_count_, rope_head_dim_, kv_head_count_);
             ncnn::Mat cos_cache;
             ncnn::Mat sin_cache;
-            make_rope_cache(0, cos_cache, sin_cache);
+            make_rope_cache(0, 2, cos_cache, sin_cache);
+            ncnn::Mat out = run_decoder_with_kv(
+                net("base_decoder_kv"),
+                make_f32_input(hidden_size_, 2),
+                make_decoder_mask(2, 0),
+                &cos_cache,
+                &sin_cache,
+                cache,
+                base_attn_count_);
+            if (out.w != hidden_size_ or out.h != 2) [[unlikely]] {
+                throw std::runtime_error("base_decoder_kv smoke output shape mismatch");
+            }
             print_mat_shape(
-                "base_decoder_step",
-                run_decoder_step_with_kv(
-                    net("base_decoder_step"),
-                    make_f32_input1d(hidden_size_),
-                    make_step_mask(1),
-                    &cos_cache,
-                    &sin_cache,
-                    cache,
-                    base_attn_count_));
+                "base_decoder_kv",
+                out);
         }
         {
-            PagedKvCache cache(residual_attn_count_);
+            DecoderKvCache cache(residual_attn_count_, rope_head_dim_, kv_head_count_);
+            ncnn::Mat out = run_decoder_with_kv(
+                net("residual_decoder_kv"),
+                make_f32_input(hidden_size_, 2),
+                make_decoder_mask(2, 0),
+                nullptr,
+                nullptr,
+                cache,
+                residual_attn_count_);
+            if (out.w != hidden_size_ or out.h != 2) [[unlikely]] {
+                throw std::runtime_error("residual_decoder_kv smoke output shape mismatch");
+            }
             print_mat_shape(
-                "residual_decoder_step",
-                run_decoder_step_with_kv(
-                    net("residual_decoder_step"),
-                    make_f32_input1d(hidden_size_),
-                    make_step_mask(1),
-                    nullptr,
-                    nullptr,
-                    cache,
-                    residual_attn_count_));
+                "residual_decoder_kv",
+                out);
         }
         print_mat_shape("feat_encoder", run_single_input(net("feat_encoder"), make_f32_input(feat_dim_, patch_size_)));
         print_mat_shape("fsq", run_single_input(net("fsq"), make_f32_input(hidden_size_, 1)));
@@ -704,8 +623,8 @@ public:
     std::vector<std::string> missing_required_components() const {
         static const std::vector<std::string> required = {
             "text_embed",
-            "base_decoder_step",
-            "residual_decoder_step",
+            "base_decoder_kv",
+            "residual_decoder_kv",
             "fsq",
             "fusion_proj",
             "dit_proj",
@@ -737,6 +656,10 @@ private:
         if (model_type != "voxcpm2_tts") [[unlikely]] {
             throw std::runtime_error("model.json model_type must be voxcpm2_tts");
         }
+        format_version_ = manifest_.value("format_version", 1);
+        if (format_version_ < 2) [[unlikely]] {
+            throw std::runtime_error("VoxCPM2 ncnn assets must be format_version >= 2; re-export assets");
+        }
 
         const auto setting = manifest_.value("setting", json::object());
         patch_size_ = setting.value("patch_size", patch_size_);
@@ -747,6 +670,7 @@ private:
         out_sample_rate_ = setting.value("out_sample_rate", out_sample_rate_);
         base_attn_count_ = setting.value("base_attn_cnt", base_attn_count_);
         residual_attn_count_ = setting.value("residual_attn_cnt", residual_attn_count_);
+        kv_head_count_ = setting.value("kv_head_cnt", kv_head_count_);
 
         const auto rope = setting.value("rope", json::object());
         rope_head_dim_ = rope.value("rope_head_dim", rope_head_dim_);
@@ -774,8 +698,8 @@ private:
         const auto params = manifest_.value("params", json::object());
         static const std::vector<std::string> supported_order = {
             "text_embed",
-            "base_decoder_step",
-            "residual_decoder_step",
+            "base_decoder_kv",
+            "residual_decoder_kv",
             "fsq",
             "fusion_proj",
             "dit_proj",
@@ -871,34 +795,46 @@ private:
         return patches;
     }
 
-    void make_rope_cache(int position_id, ncnn::Mat& cos_cache, ncnn::Mat& sin_cache) const {
+    void make_rope_cache(int position_start, int length, ncnn::Mat& cos_cache, ncnn::Mat& sin_cache) const {
         if (rope_head_dim_ <= 0 or rope_head_dim_ % 2 != 0) [[unlikely]] {
             throw std::runtime_error("invalid VoxCPM2 rope head dim");
         }
+        if (position_start < 0 or length <= 0) [[unlikely]] {
+            throw std::runtime_error("invalid VoxCPM2 rope range");
+        }
         const int half_dim = rope_head_dim_ / 2;
         const std::vector<float>& factor =
-            (position_id + 1 > rope_original_max_position_embeddings_ and not rope_long_factor_.empty())
+            (position_start + length > rope_original_max_position_embeddings_ and not rope_long_factor_.empty())
                 ? rope_long_factor_
                 : rope_short_factor_;
         if (static_cast<int>(factor.size()) < half_dim) [[unlikely]] {
             throw std::runtime_error("VoxCPM2 rope factor table is missing or too short");
         }
 
-        cos_cache.create(rope_head_dim_);
-        sin_cache.create(rope_head_dim_);
+        cos_cache.create(rope_head_dim_, length);
+        sin_cache.create(rope_head_dim_, length);
         auto* cos_ptr = static_cast<float*>(cos_cache.data);
         auto* sin_ptr = static_cast<float*>(sin_cache.data);
-        for (int j = 0; j < half_dim; ++j) {
-            const float exponent = (2.0f * static_cast<float>(j)) / static_cast<float>(rope_head_dim_);
-            const float inv_freq = 1.0f / std::pow(rope_theta_, exponent);
-            const float freq = (static_cast<float>(position_id) / factor[static_cast<std::size_t>(j)]) * inv_freq;
-            const float c = std::cos(freq);
-            const float s = std::sin(freq);
-            cos_ptr[j] = c;
-            cos_ptr[j + half_dim] = c;
-            sin_ptr[j] = s;
-            sin_ptr[j + half_dim] = s;
+        for (int pos = 0; pos < length; ++pos) {
+            const int position_id = position_start + pos;
+            float* cos_row = cos_ptr + static_cast<std::size_t>(pos) * rope_head_dim_;
+            float* sin_row = sin_ptr + static_cast<std::size_t>(pos) * rope_head_dim_;
+            for (int j = 0; j < half_dim; ++j) {
+                const float exponent = (2.0f * static_cast<float>(j)) / static_cast<float>(rope_head_dim_);
+                const float inv_freq = 1.0f / std::pow(rope_theta_, exponent);
+                const float freq = (static_cast<float>(position_id) / factor[static_cast<std::size_t>(j)]) * inv_freq;
+                const float c = std::cos(freq);
+                const float s = std::sin(freq);
+                cos_row[j] = c;
+                cos_row[j + half_dim] = c;
+                sin_row[j] = s;
+                sin_row[j + half_dim] = s;
+            }
         }
+    }
+
+    void make_rope_cache(int position_id, ncnn::Mat& cos_cache, ncnn::Mat& sin_cache) const {
+        make_rope_cache(position_id, 1, cos_cache, sin_cache);
     }
 
     ncnn::Option option_for_net(const std::string& name) const {
@@ -926,8 +862,12 @@ private:
     Tokenizer tokenizer_;
     std::unordered_map<std::string, std::shared_ptr<ncnn::Net>> nets_;
     bool use_vulkan_ = false;
+#ifdef VOXCPM2_ENABLE_PROFILE
+    bool profile_ = false;
+#endif
     int threads_ = 4;
     int vulkan_device_ = 0;
+    int format_version_ = 2;
 
     int hidden_size_ = 2048;
     int patch_size_ = 4;
@@ -941,6 +881,7 @@ private:
     int out_sample_rate_ = 48000;
     int base_attn_count_ = 28;
     int residual_attn_count_ = 8;
+    int kv_head_count_ = 2;
     int rope_head_dim_ = 128;
     int rope_original_max_position_embeddings_ = 32768;
     int max_generation_patches_ = 2000;

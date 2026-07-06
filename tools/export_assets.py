@@ -13,8 +13,8 @@ from pathlib import Path
 
 RUNTIME_COMPONENTS = [
     "text_embed",
-    "base_decoder_step",
-    "residual_decoder_step",
+    "base_decoder_kv",
+    "residual_decoder_kv",
     "fsq",
     "fusion_proj",
     "dit_proj",
@@ -54,7 +54,7 @@ def main() -> None:
 
     manifest = {
         "model_type": "voxcpm2_tts",
-        "format_version": 1,
+        "format_version": 2,
         "params": {},
         "missing_components": RUNTIME_COMPONENTS,
         "tokenizer": {
@@ -73,6 +73,7 @@ def main() -> None:
             "out_sample_rate": 48000,
             "base_attn_cnt": 28,
             "residual_attn_cnt": 8,
+            "kv_head_cnt": config["lm_config"].get("num_key_value_heads", 2),
             "tokens": {
                 "audio_start": 101,
                 "audio_end": 102,

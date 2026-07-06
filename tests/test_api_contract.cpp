@@ -6,7 +6,6 @@
 
 #include "voxcpm2/audio.h"
 #include "voxcpm2/audio_io.h"
-#include "voxcpm2/paged_kv_cache.h"
 #include "voxcpm2/synthesizer.h"
 #include "voxcpm2/tokenizer.h"
 
@@ -21,11 +20,6 @@ static_assert(std::is_same_v<decltype(voxcpm2::AudioBuffer::sample_rate), int>);
 static_assert(std::is_same_v<decltype(voxcpm2::AudioBuffer::channels), int>);
 static_assert(std::is_same_v<decltype(voxcpm2::AudioBuffer::samples), std::vector<float>>);
 
-static_assert(std::is_constructible_v<voxcpm2::PagedKvCache, int>);
-static_assert(std::is_constructible_v<voxcpm2::PagedKvCache, int, int>);
-static_assert(std::is_same_v<decltype(std::declval<const voxcpm2::PagedKvCache&>().layer_count()), int>);
-static_assert(std::is_same_v<decltype(std::declval<const voxcpm2::PagedKvCache&>().materialize(0)), voxcpm2::KvCachePair>);
-
 static_assert(std::is_same_v<
               decltype(std::declval<const voxcpm2::Tokenizer&>().encode(std::declval<const std::string&>())),
               std::vector<int>>);
@@ -35,6 +29,9 @@ static_assert(std::is_same_v<
 
 static_assert(std::is_same_v<decltype(voxcpm2::SynthesisOptions::prompt_audio), std::optional<voxcpm2::AudioBuffer>>);
 static_assert(std::is_same_v<decltype(voxcpm2::SynthesizerConfig::model_dir), std::filesystem::path>);
+#ifdef VOXCPM2_ENABLE_PROFILE
+static_assert(std::is_same_v<decltype(voxcpm2::SynthesizerConfig::profile), bool>);
+#endif
 static_assert(not std::is_copy_constructible_v<voxcpm2::Synthesizer>);
 static_assert(not std::is_copy_assignable_v<voxcpm2::Synthesizer>);
 static_assert(std::is_move_constructible_v<voxcpm2::Synthesizer>);

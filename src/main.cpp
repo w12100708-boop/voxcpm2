@@ -44,6 +44,9 @@ struct CliOptions {
     int vulkan_device = 0;
     bool vulkan = false;
     bool no_progress = false;
+#ifdef VOXCPM2_ENABLE_PROFILE
+    bool profile = false;
+#endif
     bool smoke_components = false;
     bool tokenize = false;
 };
@@ -225,6 +228,9 @@ int main(int argc, char** argv) {
     app.add_option("--vulkan-device", cli.vulkan_device, "Vulkan device index")->capture_default_str();
     app.add_flag("--vulkan", cli.vulkan, "Enable Vulkan compute");
     app.add_flag("--no-progress", cli.no_progress, "Disable synthesis progress bars");
+#ifdef VOXCPM2_ENABLE_PROFILE
+    app.add_flag("--profile", cli.profile, "Print coarse synthesis timing to stderr");
+#endif
     app.add_flag("--smoke-components", cli.smoke_components, "Run exported component smoke checks");
     app.add_flag("--tokenize", cli.tokenize, "Print token ids for --text and exit");
 
@@ -256,6 +262,9 @@ int main(int argc, char** argv) {
         voxcpm2::Synthesizer tts(voxcpm2::SynthesizerConfig{
             .model_dir = cli.model_dir,
             .use_vulkan = cli.vulkan,
+#ifdef VOXCPM2_ENABLE_PROFILE
+            .profile = cli.profile,
+#endif
             .threads = cli.threads,
             .vulkan_device = cli.vulkan_device,
         });

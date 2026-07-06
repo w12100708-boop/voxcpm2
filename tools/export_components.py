@@ -23,8 +23,8 @@ HEAD_DIM = 128
 
 COMPONENTS = [
     "text_embed",
-    "base_decoder_step",
-    "residual_decoder_step",
+    "base_decoder_kv",
+    "residual_decoder_kv",
     "fsq",
     "fusion_proj",
     "dit_proj",
@@ -182,13 +182,23 @@ def add_sdpa_kvcache(param_path: Path) -> None:
     param_path.write_text("\n".join([lines[0], f"{layer_count} {blob_count}", *out_body]) + "\n", encoding="utf-8")
 
 
-def run_pnnx(pt_path: Path, inputs: tuple[torch.Tensor, ...], out_dir: Path, fp16: bool) -> None:
+def run_pnnx(
+    pt_path: Path,
+    inputs: tuple[torch.Tensor, ...],
+    out_dir: Path,
+    fp16: bool,
+    inputs2: tuple[torch.Tensor, ...] | None = None,
+) -> None:
     prefix = out_dir / pt_path.stem
-    result = subprocess.run(
+    cmd = [
+        pnnx.EXEC_PATH,
+        str(pt_path),
+        f"inputshape={pnnx_inputshape(inputs)}",
+    ]
+    if inputs2 is not None:
+        cmd.append(f"inputshape2={pnnx_inputshape(inputs2)}")
+    cmd.extend(
         [
-            pnnx.EXEC_PATH,
-            str(pt_path),
-            f"inputshape={pnnx_inputshape(inputs)}",
             "device=cpu",
             "optlevel=2",
             f"fp16={1 if fp16 else 0}",
@@ -199,7 +209,10 @@ def run_pnnx(pt_path: Path, inputs: tuple[torch.Tensor, ...], out_dir: Path, fp1
             f"ncnnparam={prefix.with_suffix('.ncnn.param')}",
             f"ncnnbin={prefix.with_suffix('.ncnn.bin')}",
             f"ncnnpy={prefix.parent / f'{prefix.name}_ncnn.py'}",
-        ],
+        ]
+    )
+    result = subprocess.run(
+        cmd,
         capture_output=True,
         text=True,
     )
@@ -210,7 +223,14 @@ def run_pnnx(pt_path: Path, inputs: tuple[torch.Tensor, ...], out_dir: Path, fp1
     sanitize_param(prefix.with_suffix(".ncnn.param"))
 
 
-def export_module(name: str, module: nn.Module, inputs: tuple[torch.Tensor, ...], out_dir: Path, fp16: bool) -> None:
+def export_module(
+    name: str,
+    module: nn.Module,
+    inputs: tuple[torch.Tensor, ...],
+    out_dir: Path,
+    fp16: bool,
+    inputs2: tuple[torch.Tensor, ...] | None = None,
+) -> None:
     module = module.eval().to(torch.float32)
     out_dir.mkdir(parents=True, exist_ok=True)
     pt_path = out_dir / f"{name}.pt"
@@ -218,13 +238,13 @@ def export_module(name: str, module: nn.Module, inputs: tuple[torch.Tensor, ...]
         module(*inputs)
         traced = torch.jit.trace(module, inputs, check_trace=False)
         traced.save(str(pt_path))
-    run_pnnx(pt_path, inputs, out_dir, fp16)
+    run_pnnx(pt_path, inputs, out_dir, fp16, inputs2)
     if name == "dit_prefix":
         fix_dit_prefix_param(out_dir / f"{name}.ncnn.param")
         fix_dit_time_reshape_param(out_dir / f"{name}.ncnn.param")
     if name == "dit_estimator":
         fix_dit_time_reshape_param(out_dir / f"{name}.ncnn.param")
-    if name.endswith("_decoder_step"):
+    if name.endswith("_decoder_kv"):
         add_sdpa_kvcache(out_dir / f"{name}.ncnn.param")
 
 
@@ -348,6 +368,63 @@ class DecoderStep(nn.Module):
             )
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_output = attn_output.reshape(bsz, attn.num_heads * attn.head_dim)
+            attn_output = attn.o_proj(attn_output)
+
+            if decoder_layer.use_mup:
+                hidden_states = residual + attn_output * (
+                    decoder_layer.scale_depth / (decoder_layer.num_hidden_layers**0.5)
+                )
+            else:
+                hidden_states = residual + attn_output
+
+            residual = hidden_states
+            hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
+            hidden_states = decoder_layer.mlp(hidden_states)
+            if decoder_layer.use_mup:
+                hidden_states = residual + hidden_states * (
+                    decoder_layer.scale_depth / (decoder_layer.num_hidden_layers**0.5)
+                )
+            else:
+                hidden_states = residual + hidden_states
+
+        return self.lm.norm(hidden_states)
+
+
+class DecoderKv(nn.Module):
+    def __init__(self, lm):
+        super().__init__()
+        self.lm = lm
+
+    def forward(self, inputs_embeds, attn_mask, cos=None, sin=None):
+        hidden_states = inputs_embeds
+        position_emb = None if self.lm.rope_emb is None else (cos, sin)
+
+        for decoder_layer in self.lm.layers:
+            residual = hidden_states
+            normed = decoder_layer.input_layernorm(hidden_states)
+            attn = decoder_layer.self_attn
+            bsz, q_len, _ = normed.size()
+
+            query_states = attn.q_proj(normed)
+            key_states = attn.k_proj(normed)
+            value_states = attn.v_proj(normed)
+
+            query_states = query_states.view(bsz, q_len, attn.num_heads, attn.head_dim).transpose(1, 2)
+            key_states = key_states.view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
+            value_states = value_states.view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
+
+            if position_emb is not None:
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, *position_emb)
+
+            attn_output = F.scaled_dot_product_attention(
+                query_states.contiguous(),
+                key_states.contiguous(),
+                value_states.contiguous(),
+                attn_mask=attn_mask,
+                enable_gqa=True,
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(bsz, q_len, attn.num_heads * attn.head_dim)
             attn_output = attn.o_proj(attn_output)
 
             if decoder_layer.use_mup:
@@ -561,14 +638,14 @@ def component_module(model, name: str, decoder_len: int, masked_decoder: bool) -
                 (torch.randn(1, decoder_len, model.config.lm_config.hidden_size), make_decoder_mask(decoder_len)),
             )
         return Decoder(model.base_lm), (torch.randn(1, decoder_len, model.config.lm_config.hidden_size),)
-    if name == "base_decoder_step":
+    if name == "base_decoder_kv":
         return (
-            DecoderStep(model.base_lm),
+            DecoderKv(model.base_lm),
             (
-                torch.randn(1, model.config.lm_config.hidden_size),
-                torch.zeros(1, 1, dtype=torch.float32),
-                torch.randn(1, HEAD_DIM),
-                torch.randn(1, HEAD_DIM),
+                torch.randn(1, decoder_len, model.config.lm_config.hidden_size),
+                make_decoder_mask(decoder_len),
+                torch.randn(decoder_len, HEAD_DIM),
+                torch.randn(decoder_len, HEAD_DIM),
             ),
         )
     if name == "residual_decoder":
@@ -578,12 +655,12 @@ def component_module(model, name: str, decoder_len: int, masked_decoder: bool) -
                 (torch.randn(1, decoder_len, model.config.lm_config.hidden_size), make_decoder_mask(decoder_len)),
             )
         return Decoder(model.residual_lm), (torch.randn(1, decoder_len, model.config.lm_config.hidden_size),)
-    if name == "residual_decoder_step":
+    if name == "residual_decoder_kv":
         return (
-            DecoderStep(model.residual_lm),
+            DecoderKv(model.residual_lm),
             (
-                torch.randn(1, model.config.lm_config.hidden_size),
-                torch.zeros(1, 1, dtype=torch.float32),
+                torch.randn(1, decoder_len, model.config.lm_config.hidden_size),
+                make_decoder_mask(decoder_len),
             ),
         )
     if name == "fsq":
@@ -634,9 +711,27 @@ def component_module(model, name: str, decoder_len: int, masked_decoder: bool) -
     raise ValueError(f"unknown component: {name}")
 
 
+def component_shape2_inputs(model, name: str) -> tuple[torch.Tensor, ...] | None:
+    hidden_size = model.config.lm_config.hidden_size
+    if name == "base_decoder_kv":
+        return (
+            torch.randn(1, 1, hidden_size),
+            make_decoder_mask(1),
+            torch.randn(1, HEAD_DIM),
+            torch.randn(1, HEAD_DIM),
+        )
+    if name == "residual_decoder_kv":
+        return (
+            torch.randn(1, 1, hidden_size),
+            make_decoder_mask(1),
+        )
+    return None
+
+
 def update_manifest(asset_dir: Path, exported: list[str], decoder_len: int) -> None:
     model_json = asset_dir / "model.json"
     manifest = json.loads(model_json.read_text(encoding="utf-8"))
+    manifest["format_version"] = 2
     params = manifest.setdefault("params", {})
     for name in exported:
         params[name] = {
@@ -645,6 +740,9 @@ def update_manifest(asset_dir: Path, exported: list[str], decoder_len: int) -> N
         }
     missing = [name for name in manifest.get("missing_components", []) if name not in exported]
     manifest["missing_components"] = missing
+    setting = manifest.setdefault("setting", {})
+    setting["decoder_context_length"] = decoder_len
+    setting.setdefault("kv_head_cnt", 2)
     model_json.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
@@ -671,7 +769,7 @@ def main() -> None:
     for name in args.components:
         print(f"exporting {name}", flush=True)
         module, inputs = component_module(model, name, 4, False)
-        export_module(name, module, inputs, args.asset_dir, args.fp16)
+        export_module(name, module, inputs, args.asset_dir, args.fp16, component_shape2_inputs(model, name))
         exported.append(name)
 
     update_manifest(args.asset_dir, exported, 4)

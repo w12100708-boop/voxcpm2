@@ -5,6 +5,13 @@ set_project("voxcpm2-ncnn")
 set_version("0.1.0")
 set_languages("c++23", "c11")
 
+option("profile")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable coarse VoxCPM2 synthesis profile timings")
+    add_defines("VOXCPM2_ENABLE_PROFILE")
+option_end()
+
 
 add_requires("ncnn master", { configs = { vulkan = true } })
 add_requires("nlohmann_json")
@@ -22,12 +29,17 @@ add_requires("ffmpeg", {
 
 target("voxcpm2_ncnn")
     set_kind("static")
+    add_options("profile")
     add_includedirs("include", { public = true })
-    add_files("src/audio_io.cpp", "src/paged_kv_cache.cpp", "src/progress.cpp", "src/synthesizer.cpp", "src/tokenizer.cpp")
+    add_files("src/audio_io.cpp", "src/kvcache.cpp", "src/progress.cpp", "src/synthesizer.cpp", "src/tokenizer.cpp")
+    if has_config("profile") then
+        add_files("src/profile.cpp")
+    end
     add_packages("ncnn", "nlohmann_json", "ffmpeg")
 
 target("voxcpm2")
     set_kind("binary")
+    add_options("profile")
     add_files("src/main.cpp")
     add_deps("voxcpm2_ncnn")
     add_packages("cli11", "indicators", "ncnn", "nlohmann_json", "ffmpeg")
@@ -52,18 +64,10 @@ target("test_tokenizer")
     set_rundir("$(projectdir)")
     add_tests("default")
 
-target("test_paged_kv_cache")
-    set_kind("binary")
-    set_group("test")
-    add_files("tests/test_paged_kv_cache.cpp")
-    add_deps("voxcpm2_ncnn")
-    add_packages("ncnn", "nlohmann_json", "ffmpeg")
-    set_rundir("$(projectdir)")
-    add_tests("default")
-
 target("test_api_contract")
     set_kind("binary")
     set_group("test")
+    add_options("profile")
     add_files("tests/test_api_contract.cpp")
     add_deps("voxcpm2_ncnn")
     add_packages("ncnn", "nlohmann_json", "ffmpeg")

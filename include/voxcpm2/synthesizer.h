@@ -29,6 +29,9 @@ struct SynthesisOptions {
 struct SynthesizerConfig {
     std::filesystem::path model_dir = "assets/voxcpm2";
     bool use_vulkan = false;
+#ifdef VOXCPM2_ENABLE_PROFILE
+    bool profile = false;
+#endif
     int threads = 4;
     int vulkan_device = 0;
 };
