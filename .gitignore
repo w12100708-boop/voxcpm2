@@ -8,6 +8,7 @@
 /.venv/
 /.cache/
 /compile_commands.json
+/dist/
 *.wav
 *.flac
 *.mp3

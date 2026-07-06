@@ -9,6 +9,7 @@ set_languages("c++23", "c11")
 add_requires("ncnn master", { configs = { vulkan = true } })
 add_requires("nlohmann_json")
 add_requires("cli11")
+add_requires("indicators")
 add_requires("ffmpeg", {
     system = true,
     configs = {
@@ -22,15 +23,25 @@ add_requires("ffmpeg", {
 target("voxcpm2_ncnn")
     set_kind("static")
     add_includedirs("include", { public = true })
-    add_files("src/audio_io.cpp", "src/paged_kv_cache.cpp", "src/synthesizer.cpp", "src/tokenizer.cpp")
+    add_files("src/audio_io.cpp", "src/paged_kv_cache.cpp", "src/progress.cpp", "src/synthesizer.cpp", "src/tokenizer.cpp")
     add_packages("ncnn", "nlohmann_json", "ffmpeg")
 
 target("voxcpm2")
     set_kind("binary")
     add_files("src/main.cpp")
     add_deps("voxcpm2_ncnn")
-    add_packages("cli11", "ncnn", "nlohmann_json", "ffmpeg")
+    add_packages("cli11", "indicators", "ncnn", "nlohmann_json", "ffmpeg")
     set_rundir("$(projectdir)")
+
+target("test_progress")
+    set_kind("binary")
+    set_group("test")
+    add_includedirs("src")
+    add_files("tests/test_progress.cpp")
+    add_deps("voxcpm2_ncnn")
+    add_packages("ncnn", "nlohmann_json", "ffmpeg")
+    set_rundir("$(projectdir)")
+    add_tests("default")
 
 target("test_tokenizer")
     set_kind("binary")

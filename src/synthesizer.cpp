@@ -6,6 +6,7 @@
 
 #include "voxcpm2/synthesizer.h"
 
+#include "progress.h"
 #include "voxcpm2/paged_kv_cache.h"
 #include "voxcpm2/tokenizer.h"
 
@@ -24,7 +25,6 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 #include <mat.h>
@@ -242,6 +242,7 @@ std::vector<float> cfm_sample(ncnn::Net& dit_estimator,
     }
 
     for (int step = 1; step <= timesteps; ++step) {
+        progress::current("dit_estimator", step, timesteps);
         std::vector<float> dphi(static_cast<std::size_t>(latent_size), 0.0f);
         if (step > zero_init_steps) {
             std::vector<float> mu_positive(2048, 0.0f);
@@ -440,10 +441,13 @@ public:
         }
 
         const int prefix_len = static_cast<int>(prefix.size());
+        progress::begin_phase(progress::Phase::prefix, "prefix", prefix_len + 1);
+        progress::current("text_embed", 1, 1);
         std::vector<float> text_embed = run_net_vec(net("text_embed"), {make_i32_input(token_ids)});
         if (static_cast<int>(text_embed.size()) != prefix_len * hidden_size_) [[unlikely]] {
             throw std::runtime_error("text_embed output size mismatch");
         }
+        progress::advance_phase("text_embed");
 
         std::vector<std::vector<float>> feat_embeds(static_cast<std::size_t>(prefix_len),
                                                     std::vector<float>(hidden_size_, 0.0f));
@@ -451,6 +455,7 @@ public:
             if (not prefix[static_cast<std::size_t>(i)].is_audio) {
                 continue;
             }
+            progress::current("feat_encoder", i + 1, prefix_len);
             const std::vector<float> feat_input =
                 transpose_d_p_to_p_d(prefix[static_cast<std::size_t>(i)].audio_latent_d_p, feat_dim_, patch_size_);
             feat_embeds[static_cast<std::size_t>(i)] =
@@ -478,6 +483,7 @@ public:
             ncnn::Mat cos_cache;
             ncnn::Mat sin_cache;
             make_rope_cache(pos, cos_cache, sin_cache);
+            progress::current("base_decoder_step", pos + 1, prefix_len);
             ncnn::Mat base_out = run_decoder_step_with_kv(
                 net("base_decoder_step"),
                 make_f32_vec(embed),
@@ -497,12 +503,14 @@ public:
                 prefix_feat_cond = zero_latent_d_p(feat_dim_, patch_size_);
             }
 
+            progress::current("fusion_proj", pos + 1, prefix_len);
             std::vector<float> residual_input = run_net_vec(
                 net("fusion_proj"),
                 {
                     make_f32_mat(hidden_size_, 1, current_lm_hidden),
                     make_f32_mat(hidden_size_, 1, row.is_audio ? feat_embeds[static_cast<std::size_t>(pos)] : zero_embed),
                 });
+            progress::current("residual_decoder_step", pos + 1, prefix_len);
             ncnn::Mat residual_out = run_decoder_step_with_kv(
                 net("residual_decoder_step"),
                 make_f32_vec(residual_input),
@@ -515,8 +523,11 @@ public:
             if (static_cast<int>(current_residual_hidden.size()) != hidden_size_) [[unlikely]] {
                 throw std::runtime_error("residual_decoder_step output size mismatch");
             }
+            progress::advance_phase("prefix");
         }
+        progress::finish_phase("prefix");
 
+        progress::begin_phase(progress::Phase::generation, "generation", max_patches);
         for (int step = 0; step < max_patches; ++step) {
             if (static_cast<int>(current_lm_hidden.size()) != hidden_size_ or
                 static_cast<int>(current_residual_hidden.size()) != hidden_size_) [[unlikely]] {
@@ -526,6 +537,7 @@ public:
                 throw std::runtime_error("VoxCPM2 KV cache reached the exported RoPE range");
             }
 
+            progress::current("dit_proj", step + 1, max_patches);
             std::vector<float> dit_hidden = run_net_vec(
                 net("dit_proj"),
                 {
@@ -550,10 +562,12 @@ public:
 
             const std::vector<float> stop_logits =
                 run_net_vec(net("stop_head"), {make_f32_mat(hidden_size_, 1, current_lm_hidden)});
+            progress::advance_phase("generation");
             if (step > options.min_patches and argmax2(stop_logits) == 1) {
                 break;
             }
 
+            progress::current("feat_encoder", step + 1, max_patches);
             const std::vector<float> feat_input = transpose_d_p_to_p_d(latent, feat_dim_, patch_size_);
             std::vector<float> feat_embed = run_net_vec(net("feat_encoder"), {make_f32_mat(feat_dim_, patch_size_, feat_input)});
             if (static_cast<int>(feat_embed.size()) != hidden_size_) [[unlikely]] {
@@ -564,6 +578,7 @@ public:
             ncnn::Mat cos_cache;
             ncnn::Mat sin_cache;
             make_rope_cache(patch_pos, cos_cache, sin_cache);
+            progress::current("base_decoder_step", step + 1, max_patches);
             ncnn::Mat base_out = run_decoder_step_with_kv(
                 net("base_decoder_step"),
                 make_f32_vec(feat_embed),
@@ -577,14 +592,17 @@ public:
                 throw std::runtime_error("base_decoder_step output size mismatch");
             }
 
+            progress::current("fsq", step + 1, max_patches);
             std::vector<float> processed = run_net_vec(net("fsq"), {make_f32_mat(hidden_size_, 1, current_lm_hidden)});
             current_lm_hidden = processed;
+            progress::current("fusion_proj", step + 1, max_patches);
             std::vector<float> residual_input = run_net_vec(
                 net("fusion_proj"),
                 {
                     make_f32_mat(hidden_size_, 1, processed),
                     make_f32_mat(hidden_size_, 1, feat_embed),
                 });
+            progress::current("residual_decoder_step", step + 1, max_patches);
             ncnn::Mat residual_out = run_decoder_step_with_kv(
                 net("residual_decoder_step"),
                 make_f32_vec(residual_input),
@@ -598,11 +616,16 @@ public:
                 throw std::runtime_error("residual_decoder_step output size mismatch");
             }
         }
+        progress::finish_phase("generation");
 
         std::vector<float> vae_latent = build_vae_latent(patch_latents, latent_dim_, patch_size_);
+        progress::begin_phase(progress::Phase::decode, "decode", 1);
+        progress::current("audio_vae_decoder", 1, 1);
         std::vector<float> samples = run_net_vec(
             net("audio_vae_decoder"),
             {make_f32_mat(static_cast<int>(patch_latents.size()) * patch_size_, latent_dim_, vae_latent)});
+        progress::advance_phase("audio_vae_decoder");
+        progress::finish_phase("decode");
         return AudioBuffer{.sample_rate = out_sample_rate_, .channels = 1, .samples = std::move(samples)};
     }
 
@@ -749,7 +772,7 @@ private:
         ref_audio_end_token_ = tokens.value("ref_audio_end", ref_audio_end_token_);
 
         const auto params = manifest_.value("params", json::object());
-        static const std::unordered_set<std::string> supported = {
+        static const std::vector<std::string> supported_order = {
             "text_embed",
             "base_decoder_step",
             "residual_decoder_step",
@@ -762,11 +785,15 @@ private:
             "audio_vae_encoder",
             "audio_vae_decoder",
         };
-        for (auto it = params.begin(); it != params.end(); ++it) {
-            if (supported.contains(it.key())) {
-                load_net(it.key(), it.value());
+        progress::begin_phase(progress::Phase::model_load, "model load", static_cast<int>(supported_order.size()));
+        for (const auto& name : supported_order) {
+            if (params.contains(name)) {
+                progress::current(name, static_cast<int>(nets_.size()) + 1, static_cast<int>(supported_order.size()));
+                load_net(name, params.at(name));
             }
+            progress::advance_phase(name);
         }
+        progress::finish_phase("model load");
     }
 
     void load_net(const std::string& name, const json& params) {
@@ -885,9 +912,9 @@ private:
         opt.use_int8_packed = false;
         opt.use_int8_arithmetic = false;
         opt.use_vulkan_compute = use_vulkan_;
-        if (name == "text_embed") {
-            opt.use_vulkan_compute = false;
-        }
+        // if (name == "text_embed") {
+        //     opt.use_vulkan_compute = false;
+        // }
         if (name == "dit_estimator") {
             opt.use_packing_layout = false;
         }
