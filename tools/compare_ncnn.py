@@ -27,8 +27,8 @@ class PrecisionConfig:
 def read_component_paths(asset_dir: Path, component: str, config: PrecisionConfig) -> tuple[Path, Path]:
     manifest = json.loads((asset_dir / "model.json").read_text())
     key = component
-    if key not in manifest["params"] and component == "dit_estimator":
-        key = "dit_estimator.vulkan" if config.vulkan else "dit_estimator.cpu"
+    if key not in manifest["params"] and component in ("dit_estimator", "base_decoder_kv", "residual_decoder_kv", "feat_encoder"):
+        key = f"{component}.vulkan" if config.vulkan else f"{component}.cpu"
     params = manifest["params"][key]
     return asset_dir / params["param"], asset_dir / params["bin"]
 
@@ -61,6 +61,57 @@ def rewrite_custom_sdpa_to_native(text: str) -> str:
             line = "SDPA" + line[len("VoxCPM2SDPA") :]
         out.append(line)
     return "\n".join(out) + "\n"
+
+
+def rewrite_dtype_adapter_to_rmsnorm(text: str) -> str:
+    """Collapse VoxCPM2DTypeAdapter -> RMSNorm -> Cast triples back to plain RMSNorm.
+
+    This allows the Python comparison harness to load the Vulkan param without
+    the C++-only VoxCPM2DTypeAdapter custom layer.
+    """
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return text
+    magic = lines[0]
+    body = lines[2:]
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        fields = body[i].split()
+        if (
+            fields
+            and fields[0] == "VoxCPM2DTypeAdapter"
+            and i + 2 < len(body)
+        ):
+            rms_fields = body[i + 1].split()
+            cast_fields = body[i + 2].split()
+            if (
+                len(fields) >= 6
+                and rms_fields
+                and rms_fields[0] == "RMSNorm"
+                and cast_fields
+                and cast_fields[0] == "Cast"
+                and int(fields[2]) == 1
+                and int(fields[3]) == 1
+                and int(rms_fields[2]) == 1
+                and int(rms_fields[3]) == 1
+                and int(cast_fields[2]) == 1
+                and int(cast_fields[3]) == 1
+                and rms_fields[4] == fields[5]
+                and cast_fields[4] == rms_fields[5]
+            ):
+                rms_fields[4] = fields[4]
+                rms_fields[5] = cast_fields[5]
+                out.append(format_layer(rms_fields))
+                i += 3
+                continue
+        out.append(body[i])
+        i += 1
+
+    layer_lines = [line for line in out if line.strip()]
+    layer_count = len(layer_lines)
+    blob_count = sum(int(line.split()[3]) for line in layer_lines)
+    return "\n".join([magic, f"{layer_count} {blob_count}", *layer_lines]) + "\n"
 
 
 def apply_param_rewrite(text: str, rewrite: str) -> str:
@@ -305,6 +356,7 @@ def main() -> int:
     parser.add_argument("--target-preset", default="full-fp16-vk")
     parser.add_argument("--rewrite", choices=["none", "gemm-output-fp32", "sdpa-boundary-fp32", "rmsnorm-boundary-fp32"], default="none")
     parser.add_argument("--native-sdpa", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--native-rmsnorm", action=argparse.BooleanOptionalAction, default=True, help="collapse VoxCPM2DTypeAdapter triples to plain RMSNorm")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--vulkan-device", type=int, default=0)
     args = parser.parse_args()
@@ -328,6 +380,9 @@ def main() -> int:
     if args.native_sdpa:
         base_param_text = rewrite_custom_sdpa_to_native(base_param_text)
         target_param_text = rewrite_custom_sdpa_to_native(target_param_text)
+    if args.native_rmsnorm:
+        base_param_text = rewrite_dtype_adapter_to_rmsnorm(base_param_text)
+        target_param_text = rewrite_dtype_adapter_to_rmsnorm(target_param_text)
 
     ncnn.create_gpu_instance()
     base = None

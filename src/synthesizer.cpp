@@ -8,9 +8,7 @@
 
 #include "helpers.h"
 #include "kvcache.h"
-#include "ncnn_layers/dtype_adapter/voxcpm2_dtype_adapter.h"
-#include "ncnn_layers/sdpa/voxcpm2_sdpa.h"
-#include "ncnn_layers/timestep_embedding/voxcpm2_timestep_embedding.h"
+#include "ncnn_layers/registry.h"
 #include "progress.h"
 #ifdef VOXCPM2_ENABLE_PROFILE
 #include "profile.h"
@@ -717,23 +715,16 @@ private:
         };
         progress::begin_phase(progress::Phase::model_load, "model load", static_cast<int>(supported_order.size()));
         for (const auto& name : supported_order) {
-            const std::string param_key = manifest_param_key(name);
+            const std::string param_key = resolve_param_key(name, use_vulkan_);
             if (params.contains(param_key)) {
                 progress::current(name, static_cast<int>(nets_.size()) + 1, static_cast<int>(supported_order.size()));
                 load_net(name, params.at(param_key));
-            } else if (name == "dit_estimator") {
+            } else if (is_dual_backend_component(name)) {
                 throw std::runtime_error("model.json missing params." + param_key);
             }
             progress::advance_phase(name);
         }
         progress::finish_phase("model load");
-    }
-
-    std::string manifest_param_key(const std::string& name) const {
-        if (name == "dit_estimator") {
-            return use_vulkan_ ? "dit_estimator.vulkan" : "dit_estimator.cpu";
-        }
-        return name;
     }
 
     void load_net(const std::string& name, const json& params) {
@@ -753,11 +744,7 @@ private:
             net_ptr->set_vulkan_device(vulkan_device_);
         }
 #endif
-        if (name == "dit_estimator") {
-            register_voxcpm2_dtype_adapter(*net_ptr);
-            register_voxcpm2_sdpa(*net_ptr);
-            register_voxcpm2_timestep_embedding(*net_ptr);
-        }
+        register_component_layers(*net_ptr, name);
         if (net_ptr->load_param((model_dir_ / param_file).string().c_str()) != 0) [[unlikely]] {
             throw std::runtime_error("failed to load param for " + name);
         }
@@ -871,19 +858,12 @@ private:
         opt.use_int8_packed = false;
         opt.use_int8_arithmetic = false;
         opt.use_vulkan_compute = use_vulkan_;
-        if (name == "base_decoder_kv" or name == "residual_decoder_kv" or name == "feat_encoder") {
-            // These graphs use fp16 weights, but fp16 Vulkan storage/packing is
-            // numerically unstable for the current exported shapes.
+        if (is_dual_backend_component(name) and not use_vulkan_) {
+            // CPU paths stay in fp32 storage; Vulkan paths use fp16 with
+            // RMSNorm isolated via VoxCPM2DTypeAdapter.
             opt.use_fp16_storage = false;
             opt.use_fp16_packed = false;
         }
-        if (name == "dit_estimator" and not use_vulkan_) {
-            // ncnn x86 Gemm does not consume fp16-storage activations correctly.
-            // Keep the CPU DiT graph in fp32 storage; Vulkan still uses fp16.
-            opt.use_fp16_storage = false;
-            opt.use_fp16_packed = false;
-        }
-        (void)name;
         return opt;
     }
 

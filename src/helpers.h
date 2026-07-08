@@ -6,17 +6,41 @@
 
 #pragma once
 
+#include <array>
 #include <cstring>
 #include <format>
 #include <print>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <mat.h>
 #include <net.h>
 
 namespace voxcpm2::runtime {
+
+// Components with separate .cpu/.vulkan param variants that run fp16 on Vulkan
+// via VoxCPM2DTypeAdapter-wrapped RMSNorm, and stay fp32 on CPU.
+inline constexpr std::array<const char*, 4> kDualBackendComponents = {
+    "dit_estimator", "base_decoder_kv", "residual_decoder_kv", "feat_encoder",
+};
+
+constexpr bool is_dual_backend_component(std::string_view name) {
+    for (auto* c : kDualBackendComponents) {
+        if (name == c) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline std::string resolve_param_key(const std::string& name, bool use_vulkan) {
+    if (is_dual_backend_component(name)) {
+        return use_vulkan ? name + ".vulkan" : name + ".cpu";
+    }
+    return name;
+}
 
 inline ncnn::Mat make_i64_input(int w, int h) {
     ncnn::Mat mat(w, h, std::size_t{8});

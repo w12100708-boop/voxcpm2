@@ -309,7 +309,12 @@ def make_dit_vulkan_param_body(cpu_body: list[str]) -> list[str]:
     return out
 
 
-def write_dit_backend_params(param_path: Path) -> None:
+def write_backend_params(param_path: Path, cpu_name: str, vulkan_name: str) -> None:
+    """Split a single ncnn param into CPU and Vulkan variants.
+
+    The Vulkan variant wraps every RMSNorm in a fp16->fp32->fp16 adapter
+    triple so the surrounding fp16 graph keeps numerically safe RMSNorm.
+    """
     lines = param_path.read_text(encoding="utf-8").splitlines()
     if len(lines) < 2 or lines[0].strip() != "7767517":
         raise RuntimeError(f"not an ncnn param file: {param_path}")
@@ -317,8 +322,17 @@ def write_dit_backend_params(param_path: Path) -> None:
     normalized_body = normalize_dit_cpu_param_body(lines[2:])
     cpu_body = add_rmsnorm_fp32_flags(normalized_body)
     vulkan_body = make_dit_vulkan_param_body(normalized_body)
-    write_ncnn_param(param_path.with_name("dit_estimator.cpu.ncnn.param"), lines[0], cpu_body)
-    write_ncnn_param(param_path.with_name("dit_estimator.vulkan.ncnn.param"), lines[0], vulkan_body)
+    write_ncnn_param(param_path.with_name(cpu_name), lines[0], cpu_body)
+    write_ncnn_param(param_path.with_name(vulkan_name), lines[0], vulkan_body)
+
+
+def write_component_backend_params(param_path: Path, name: str) -> None:
+    """Generate <name>.cpu.ncnn.param and <name>.vulkan.ncnn.param."""
+    write_backend_params(
+        param_path,
+        f"{name}.cpu.ncnn.param",
+        f"{name}.vulkan.ncnn.param",
+    )
 
 
 def fix_dit_prefix_param(param_path: Path) -> None:
@@ -526,9 +540,15 @@ def postprocess_exported_param(name: str, out_dir: Path) -> None:
         fuse_dit_timestep_embedding_param(out_dir / f"{name}.ncnn.param")
         force_dit_gemm_output_fp32_param(out_dir / f"{name}.ncnn.param")
         rename_dit_sdpa_param(out_dir / f"{name}.ncnn.param")
-        write_dit_backend_params(out_dir / f"{name}.ncnn.param")
-    if name.endswith("_decoder_kv"):
+        write_component_backend_params(out_dir / f"{name}.ncnn.param", name)
+    if name == "base_decoder_kv":
         add_sdpa_kvcache(out_dir / f"{name}.ncnn.param")
+        write_component_backend_params(out_dir / f"{name}.ncnn.param", name)
+    elif name == "residual_decoder_kv":
+        add_sdpa_kvcache(out_dir / f"{name}.ncnn.param")
+        write_component_backend_params(out_dir / f"{name}.ncnn.param", name)
+    elif name == "feat_encoder":
+        write_component_backend_params(out_dir / f"{name}.ncnn.param", name)
 
 
 def cleanup_intermediates(name: str, out_dir: Path) -> None:
@@ -1109,23 +1129,27 @@ def update_manifest(asset_dir: Path, exported: list[str], decoder_len: int) -> N
     manifest["format_version"] = 2
     current_params = manifest.get("params", {})
     exported_set = set(exported)
+    dual_backend_components = {"dit_estimator", "base_decoder_kv", "residual_decoder_kv", "feat_encoder"}
     allowed = [
         name
         for name in COMPONENTS
         if name in exported_set
         or name in current_params
-        or (name == "dit_estimator" and ("dit_estimator.cpu" in current_params or "dit_estimator.vulkan" in current_params))
+        or any(
+            name == comp and (f"{comp}.cpu" in current_params or f"{comp}.vulkan" in current_params)
+            for comp in dual_backend_components
+        )
     ]
     params: dict[str, dict[str, str]] = {}
     for name in allowed:
-        if name == "dit_estimator":
-            params["dit_estimator.cpu"] = {
-                "param": "dit_estimator.cpu.ncnn.param",
-                "bin": "dit_estimator.ncnn.bin",
+        if name in dual_backend_components:
+            params[f"{name}.cpu"] = {
+                "param": f"{name}.cpu.ncnn.param",
+                "bin": f"{name}.ncnn.bin",
             }
-            params["dit_estimator.vulkan"] = {
-                "param": "dit_estimator.vulkan.ncnn.param",
-                "bin": "dit_estimator.ncnn.bin",
+            params[f"{name}.vulkan"] = {
+                "param": f"{name}.vulkan.ncnn.param",
+                "bin": f"{name}.ncnn.bin",
             }
             continue
         params[name] = {
