@@ -102,7 +102,9 @@ components off fp16 storage/packing, so those fast-attention and cooperative
 matrix kernels are present but normally not selected on the known-good audio
 path.
 
-For CPU/Vulkan tensor comparisons, use the Python helper:
+For preset-based tensor comparisons, use the Python helper. By default it
+compares the safe Vulkan preset against the full-fp16 Vulkan preset; pass
+`--base-preset`, `--target-preset`, and `--scan` for broader blob scans.
 
 ```sh
 uv run tools/compare_ncnn.py --asset-dir assets/voxcpm2 --component dit_estimator

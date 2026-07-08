@@ -66,16 +66,259 @@ def rename_dit_sdpa_param(param_path: Path) -> None:
     lines = param_path.read_text(encoding="utf-8").splitlines()
     out: list[str] = []
     fixed = 0
+    existing = 0
     for line in lines:
         fields = line.split()
         if fields and fields[0] == "SDPA":
             fields[0] = "VoxCPM2SDPA"
             line = "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
             fixed += 1
+        elif fields and fields[0] == "VoxCPM2SDPA":
+            existing += 1
         out.append(line)
-    if fixed == 0:
+    if fixed == 0 and existing == 0:
         raise RuntimeError(f"no SDPA layer found in {param_path}")
     param_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def fuse_dit_timestep_embedding_param(param_path: Path) -> None:
+    lines = param_path.read_text(encoding="utf-8").splitlines()
+    if len(lines) < 2 or lines[0].strip() != "7767517":
+        raise RuntimeError(f"not an ncnn param file: {param_path}")
+
+    body = lines[2:]
+    out: list[str] = []
+    i = 0
+    fused = 0
+
+    def is_layer(line: str, layer_type: str, bottom: str | None = None) -> bool:
+        fields = line.split()
+        if not fields or fields[0] != layer_type:
+            return False
+        if bottom is not None:
+            nin = int(fields[2])
+            return bottom in fields[4 : 4 + nin]
+        return True
+
+    while i < len(body):
+        fields = body[i].split()
+        if fields and fields[0] == "Reshape" and len(fields) >= 7 and fields[4] in {"in2", "in4"}:
+            source = fields[4]
+            consumed = 9 if source == "in2" else 7
+            branch = body[i : i + consumed]
+            if len(branch) != consumed:
+                raise RuntimeError(f"incomplete timestep branch in {param_path}: {body[i]}")
+
+            if source == "in2":
+                checks = [
+                    is_layer(branch[0], "Reshape", "in2"),
+                    is_layer(branch[1], "MemoryData"),
+                    is_layer(branch[2], "Split"),
+                    is_layer(branch[3], "BinaryOp"),
+                    is_layer(branch[4], "BinaryOp"),
+                    is_layer(branch[5], "Split"),
+                    is_layer(branch[6], "UnaryOp"),
+                    is_layer(branch[7], "UnaryOp"),
+                    is_layer(branch[8], "Concat"),
+                ]
+                concat_fields = branch[8].split()
+            else:
+                checks = [
+                    is_layer(branch[0], "Reshape", "in4"),
+                    is_layer(branch[1], "BinaryOp"),
+                    is_layer(branch[2], "BinaryOp"),
+                    is_layer(branch[3], "Split"),
+                    is_layer(branch[4], "UnaryOp"),
+                    is_layer(branch[5], "UnaryOp"),
+                    is_layer(branch[6], "Concat"),
+                ]
+                concat_fields = branch[6].split()
+
+            if not all(checks):
+                raise RuntimeError(f"unexpected timestep branch in {param_path}: {body[i]}")
+            if concat_fields[0] != "Concat" or int(concat_fields[2]) != 2 or int(concat_fields[3]) != 1:
+                raise RuntimeError(f"unexpected timestep concat in {param_path}: {' '.join(concat_fields)}")
+
+            output_blob = concat_fields[4 + int(concat_fields[2])]
+            if source == "in2":
+                # Keep the folded frequency table layer so the unchanged .bin
+                # stream stays aligned for all following Gemm weights.
+                out.append(branch[1])
+            out.append(
+                "%-24s %-24s %s"
+                % (
+                    "VoxCPM2TimestepEmbedding",
+                    f"timestep_embedding_{fused}",
+                    f"1 1 {source} {output_blob} 0=512 1=1000.0 2=10000.0 3={1 if source == 'in2' else 0}",
+                )
+            )
+            fused += 1
+            i += consumed
+            continue
+
+        out.append(body[i])
+        i += 1
+
+    if fused != 2:
+        raise RuntimeError(f"expected to fuse 2 DiT timestep embedding branches in {param_path}, fused {fused}")
+
+    layer_lines = [line for line in out if line.strip()]
+    layer_count = len(layer_lines)
+    blob_count = sum(int(line.split()[3]) for line in layer_lines)
+    param_path.write_text("\n".join([lines[0], f"{layer_count} {blob_count}", *out]) + "\n", encoding="utf-8")
+
+
+def force_dit_gemm_output_fp32_param(param_path: Path) -> None:
+    lines = param_path.read_text(encoding="utf-8").splitlines()
+    out: list[str] = []
+    fixed = 0
+    for line in lines:
+        fields = line.split()
+        if fields and fields[0] == "Gemm":
+            for i, field in enumerate(fields):
+                if field.startswith("13="):
+                    fields[i] = "13=1"
+                    break
+            else:
+                fields.append("13=1")
+            line = "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
+            fixed += 1
+        out.append(line)
+    if fixed == 0:
+        raise RuntimeError(f"no Gemm layer found in {param_path}")
+    param_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def format_param_line(fields: list[str]) -> str:
+    return "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
+
+
+def write_ncnn_param(path: Path, magic: str, body: list[str]) -> None:
+    layer_lines = [line for line in body if line.strip()]
+    layer_count = len(layer_lines)
+    blob_count = sum(int(line.split()[3]) for line in layer_lines)
+    path.write_text("\n".join([magic, f"{layer_count} {blob_count}", *layer_lines]) + "\n", encoding="utf-8")
+
+
+def add_rmsnorm_fp32_flags(body: list[str]) -> list[str]:
+    out: list[str] = []
+    fixed = 0
+    for line in body:
+        fields = line.split()
+        if fields and fields[0] == "RMSNorm":
+            for i, field in enumerate(fields):
+                if field.startswith("31="):
+                    fields[i] = "31=3"
+                    break
+            else:
+                fields.append("31=3")
+            line = format_param_line(fields)
+            fixed += 1
+        out.append(line)
+
+    if fixed == 0:
+        raise RuntimeError("no RMSNorm layer found in DiT param")
+    return out
+
+
+def normalize_dit_cpu_param_body(body: list[str]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    restored = 0
+    while i < len(body):
+        fields = body[i].split()
+        if fields and fields[0] == "VoxCPM2DTypeAdapter" and i + 2 < len(body):
+            rms_fields = body[i + 1].split()
+            cast_fields = body[i + 2].split()
+            if (
+                len(fields) >= 6
+                and rms_fields
+                and rms_fields[0] == "RMSNorm"
+                and cast_fields
+                and cast_fields[0] == "Cast"
+                and int(fields[2]) == 1
+                and int(fields[3]) == 1
+                and int(rms_fields[2]) == 1
+                and int(rms_fields[3]) == 1
+                and int(cast_fields[2]) == 1
+                and int(cast_fields[3]) == 1
+                and rms_fields[4] == fields[5]
+                and cast_fields[4] == rms_fields[5]
+            ):
+                rms_fields[4] = fields[4]
+                rms_fields[5] = cast_fields[5]
+                out.append(format_param_line(rms_fields))
+                restored += 1
+                i += 3
+                continue
+        out.append(body[i])
+        i += 1
+
+    if restored:
+        print(f"restored {restored} DiT RMSNorm adapter blocks to CPU fp32 graph")
+    return out
+
+
+def make_dit_vulkan_param_body(cpu_body: list[str]) -> list[str]:
+    out: list[str] = []
+    fixed = 0
+    for line in add_rmsnorm_fp32_flags(cpu_body):
+        fields = line.split()
+        if fields and fields[0] == "RMSNorm":
+            bottom_count = int(fields[2])
+            top_count = int(fields[3])
+            if bottom_count != 1 or top_count != 1:
+                raise RuntimeError(f"unexpected RMSNorm arity: {line}")
+
+            bottom = fields[4]
+            top = fields[5]
+            adapter_top = f"{bottom}_dtype_adapter_{fixed}"
+            rms_top = f"{top}_dtype_rms_{fixed}"
+
+            out.append(format_param_line([
+                "VoxCPM2DTypeAdapter",
+                f"{fields[1]}_dtype_adapter",
+                "1",
+                "1",
+                bottom,
+                adapter_top,
+            ]))
+
+            rms_fields = fields.copy()
+            rms_fields[4] = adapter_top
+            rms_fields[5] = rms_top
+            out.append(format_param_line(rms_fields))
+
+            out.append(format_param_line([
+                "Cast",
+                f"{fields[1]}_cast_out_fp16",
+                "1",
+                "1",
+                rms_top,
+                top,
+                "0=1",
+                "1=2",
+            ]))
+            fixed += 1
+            continue
+
+        out.append(line)
+
+    if fixed == 0:
+        raise RuntimeError("no RMSNorm layer found in DiT param")
+    return out
+
+
+def write_dit_backend_params(param_path: Path) -> None:
+    lines = param_path.read_text(encoding="utf-8").splitlines()
+    if len(lines) < 2 or lines[0].strip() != "7767517":
+        raise RuntimeError(f"not an ncnn param file: {param_path}")
+
+    normalized_body = normalize_dit_cpu_param_body(lines[2:])
+    cpu_body = add_rmsnorm_fp32_flags(normalized_body)
+    vulkan_body = make_dit_vulkan_param_body(normalized_body)
+    write_ncnn_param(param_path.with_name("dit_estimator.cpu.ncnn.param"), lines[0], cpu_body)
+    write_ncnn_param(param_path.with_name("dit_estimator.vulkan.ncnn.param"), lines[0], vulkan_body)
 
 
 def fix_dit_prefix_param(param_path: Path) -> None:
@@ -280,7 +523,10 @@ def postprocess_exported_param(name: str, out_dir: Path) -> None:
         fix_dit_prefix_param(out_dir / f"{name}.ncnn.param")
         fix_dit_time_reshape_param(out_dir / f"{name}.ncnn.param")
     if name == "dit_estimator":
+        fuse_dit_timestep_embedding_param(out_dir / f"{name}.ncnn.param")
+        force_dit_gemm_output_fp32_param(out_dir / f"{name}.ncnn.param")
         rename_dit_sdpa_param(out_dir / f"{name}.ncnn.param")
+        write_dit_backend_params(out_dir / f"{name}.ncnn.param")
     if name.endswith("_decoder_kv"):
         add_sdpa_kvcache(out_dir / f"{name}.ncnn.param")
 
@@ -863,15 +1109,31 @@ def update_manifest(asset_dir: Path, exported: list[str], decoder_len: int) -> N
     manifest["format_version"] = 2
     current_params = manifest.get("params", {})
     exported_set = set(exported)
-    allowed = [name for name in COMPONENTS if name in exported_set or name in current_params]
-    manifest["params"] = {
-        name: {
+    allowed = [
+        name
+        for name in COMPONENTS
+        if name in exported_set
+        or name in current_params
+        or (name == "dit_estimator" and ("dit_estimator.cpu" in current_params or "dit_estimator.vulkan" in current_params))
+    ]
+    params: dict[str, dict[str, str]] = {}
+    for name in allowed:
+        if name == "dit_estimator":
+            params["dit_estimator.cpu"] = {
+                "param": "dit_estimator.cpu.ncnn.param",
+                "bin": "dit_estimator.ncnn.bin",
+            }
+            params["dit_estimator.vulkan"] = {
+                "param": "dit_estimator.vulkan.ncnn.param",
+                "bin": "dit_estimator.ncnn.bin",
+            }
+            continue
+        params[name] = {
             "param": f"{name}.ncnn.param",
             "bin": f"{name}.ncnn.bin",
         }
-        for name in allowed
-    }
-    missing = [name for name in COMPONENTS if name not in manifest["params"]]
+    manifest["params"] = params
+    missing = [name for name in COMPONENTS if name not in allowed]
     manifest["missing_components"] = missing
     setting = manifest.setdefault("setting", {})
     setting["decoder_context_length"] = decoder_len

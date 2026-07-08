@@ -5,7 +5,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "helpers.h"
-#include "ncnn_layers/voxcpm2_sdpa.h"
+#include "ncnn_layers/sdpa/voxcpm2_sdpa.h"
 
 #include <algorithm>
 #include <cmath>
@@ -73,7 +73,7 @@ ncnn::Mat run_graph(bool native, bool vulkan) {
     ex.input("in2", voxcpm2::runtime::make_f32_mat(4, 2, 1, values(8, 0.3f)));
 
     ncnn::Mat out;
-    if (ex.extract("out0", out) != 0 || out.empty()) {
+    if (ex.extract("out0", out) != 0 or out.empty()) {
         throw std::runtime_error("failed to extract sdpa output");
     }
     return out;

@@ -253,21 +253,21 @@ int VoxCPM2SDPA::forward(const std::vector<ncnn::Mat>& bottom_blobs,
 
 int VoxCPM2SDPA::create_pipeline(const ncnn::Option& opt) {
 #if NCNN_VULKAN
-    if (!opt.use_vulkan_compute || vkdev == nullptr) {
+    if (not opt.use_vulkan_compute or vkdev == nullptr) {
         return 0;
     }
 
-    use_cooperative_matrix = vkdev->info.support_cooperative_matrix() && opt.use_cooperative_matrix && (opt.use_fp16_storage || opt.use_fp16_packed);
+    use_cooperative_matrix = vkdev->info.support_cooperative_matrix() and opt.use_cooperative_matrix and (opt.use_fp16_storage or opt.use_fp16_packed);
 
     bool use_bf16_cooperative_matrix = false;
-    if (vkdev->info.support_bf16_cooperative_matrix() && opt.use_cooperative_matrix && opt.use_bf16_storage) {
+    if (vkdev->info.support_bf16_cooperative_matrix() and opt.use_cooperative_matrix and opt.use_bf16_storage) {
         use_cooperative_matrix = true;
         use_bf16_cooperative_matrix = true;
     }
 
-    use_flash_attention = g_flash_attention_enabled.load(std::memory_order_relaxed) &&
-                          (opt.use_fp16_storage || opt.use_fp16_packed || opt.use_bf16_storage || opt.use_bf16_packed);
-    if (use_flash_attention && use_cooperative_matrix) {
+    use_flash_attention = g_flash_attention_enabled.load(std::memory_order_relaxed) and
+                          (opt.use_fp16_storage or opt.use_fp16_packed or opt.use_bf16_storage or opt.use_bf16_packed);
+    if (use_flash_attention and use_cooperative_matrix) {
         const uint32_t support_subgroup_ops = vkdev->info.support_subgroup_ops();
         const uint32_t required_subgroup_ops = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
         use_flash_attention = ((support_subgroup_ops & required_subgroup_ops) == required_subgroup_ops);
@@ -309,7 +309,7 @@ int VoxCPM2SDPA::create_pipeline(const ncnn::Option& opt) {
                 vkdev->info.get_optimal_cooperative_matrix_mnk(M, N, K, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, VK_SCOPE_SUBGROUP_KHR, FA_coopmat_M, FA_coopmat_N, FA_coopmat_K, FA_coopmat_subgroup_size);
             }
 
-            if (FA_coopmat_N != FA_coopmat_K || FA_coopmat_subgroup_size < FA_coopmat_N) {
+            if (FA_coopmat_N != FA_coopmat_K or FA_coopmat_subgroup_size < FA_coopmat_N) {
                 use_flash_attention = false;
             } else {
                 FA_UNROLL_SG_M = 2;
@@ -515,7 +515,7 @@ int VoxCPM2SDPA::create_pipeline(const ncnn::Option& opt) {
 
 int VoxCPM2SDPA::destroy_pipeline(const ncnn::Option& opt) {
 #if NCNN_VULKAN
-    if (!opt.use_vulkan_compute || vkdev == nullptr) {
+    if (not opt.use_vulkan_compute or vkdev == nullptr) {
         return 0;
     }
 
@@ -592,7 +592,7 @@ int VoxCPM2SDPA::forward(const std::vector<ncnn::VkMat>& bottom_blobs,
     const ncnn::VkMat& key = cur_key;
     const ncnn::VkMat& value = cur_value;
 
-    if (use_flash_attention && embed_dim % 8 == 0 && out_embed_dim % 8 == 0 && out_embed_dim <= FA_coopmat_N * 8) {
+    if (use_flash_attention and embed_dim % 8 == 0 and out_embed_dim % 8 == 0 and out_embed_dim <= FA_coopmat_N * 8) {
         ncnn::VkMat& top_blob = top_blobs[0];
         top_blob.create(out_embed_dim, src_seqlen, num_heads, elemsize, opt.blob_vkallocator);
         if (top_blob.empty()) {
@@ -613,7 +613,7 @@ int VoxCPM2SDPA::forward(const std::vector<ncnn::VkMat>& bottom_blobs,
         constants[3].i = embed_dim;
         constants[4].i = out_embed_dim;
         constants[5].i = num_heads;
-        constants[6].i = attn_mask_blob.dims && attn_mask_blob.c > 1 ? 3 : attn_mask_blob.dims;
+        constants[6].i = attn_mask_blob.dims and attn_mask_blob.c > 1 ? 3 : attn_mask_blob.dims;
         constants[7].i = num_heads_per_group;
         constants[8].i = query.cstep;
         constants[9].i = key.cstep;

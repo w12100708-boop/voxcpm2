@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare one ncnn component on CPU and Vulkan from Python."""
+"""Compare one ncnn component between precision presets from Python."""
 
 from __future__ import annotations
 
@@ -7,21 +7,53 @@ import argparse
 import gc
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 
 import ncnn
 import numpy as np
 
 
-def read_component_paths(asset_dir: Path, component: str) -> tuple[Path, Path]:
+@dataclass(frozen=True)
+class PrecisionConfig:
+    name: str
+    vulkan: bool
+    fp16_storage: bool
+    fp16_packed: bool
+    fp16_arithmetic: bool
+    packing_layout: bool
+
+
+def read_component_paths(asset_dir: Path, component: str, config: PrecisionConfig) -> tuple[Path, Path]:
     manifest = json.loads((asset_dir / "model.json").read_text())
-    params = manifest["params"][component]
+    key = component
+    if key not in manifest["params"] and component == "dit_estimator":
+        key = "dit_estimator.vulkan" if config.vulkan else "dit_estimator.cpu"
+    params = manifest["params"][key]
     return asset_dir / params["param"], asset_dir / params["bin"]
 
 
-def rewrite_param_text(text: str, native_sdpa: bool) -> str:
-    if not native_sdpa:
-        return text
+def format_layer(fields: list[str]) -> str:
+    return "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
+
+
+def add_or_replace_param(fields: list[str], key: str, value: str) -> None:
+    prefix = f"{key}="
+    for i, field in enumerate(fields):
+        if field.startswith(prefix):
+            fields[i] = f"{key}={value}"
+            return
+    fields.append(f"{key}={value}")
+
+
+def count_header(lines: list[str]) -> tuple[str, int, int, list[str]]:
+    if len(lines) < 2 or lines[0].strip() != "7767517":
+        raise RuntimeError("not an ncnn param file")
+    layer_count, blob_count = map(int, lines[1].split()[:2])
+    return lines[0], layer_count, blob_count, lines[2:]
+
+
+def rewrite_custom_sdpa_to_native(text: str) -> str:
     out: list[str] = []
     for line in text.splitlines():
         parts = line.split(maxsplit=1)
@@ -31,8 +63,62 @@ def rewrite_param_text(text: str, native_sdpa: bool) -> str:
     return "\n".join(out) + "\n"
 
 
-def parse_top_blobs(param_text: str) -> list[str]:
+def apply_param_rewrite(text: str, rewrite: str) -> str:
+    if rewrite == "none":
+        return text
+    if rewrite == "gemm-output-fp32":
+        out: list[str] = []
+        fixed = 0
+        for line in text.splitlines():
+            fields = line.split()
+            if fields and fields[0] == "Gemm":
+                add_or_replace_param(fields, "13", "1")
+                line = format_layer(fields)
+                fixed += 1
+            out.append(line)
+        if fixed == 0:
+            raise RuntimeError("gemm-output-fp32 matched no Gemm layers")
+        return "\n".join(out) + "\n"
+    if rewrite in {"sdpa-boundary-fp32", "rmsnorm-boundary-fp32"}:
+        magic, _layer_count, blob_count, body = count_header(text.splitlines())
+        target_layers = {"SDPA", "VoxCPM2SDPA"} if rewrite == "sdpa-boundary-fp32" else {"RMSNorm"}
+        out_body: list[str] = []
+        inserted = 0
+        for line in body:
+            fields = line.split()
+            if not fields or fields[0] not in target_layers:
+                out_body.append(line)
+                continue
+            bottom_count = int(fields[2])
+            top_count = int(fields[3])
+            bottoms = fields[4 : 4 + bottom_count]
+            tops = fields[4 + bottom_count : 4 + bottom_count + top_count]
+            params = fields[4 + bottom_count + top_count :]
+
+            cast_bottoms: list[str] = []
+            for i, bottom in enumerate(bottoms):
+                cast_top = f"{fields[1]}_fp32_in{i}"
+                out_body.append(format_layer(["Cast", f"{fields[1]}_cast_in{i}", "1", "1", bottom, cast_top, "0=0", "1=1"]))
+                cast_bottoms.append(cast_top)
+                inserted += 1
+
+            internal_tops = [f"{fields[1]}_fp32_out{i}" for i in range(top_count)]
+            layer_fields = fields[:4] + cast_bottoms + internal_tops + params
+            out_body.append(format_layer(layer_fields))
+            for i, top in enumerate(tops):
+                out_body.append(format_layer(["Cast", f"{fields[1]}_cast_out{i}", "1", "1", internal_tops[i], top, "0=0", "1=1"]))
+                inserted += 1
+
+        if inserted == 0:
+            raise RuntimeError(f"{rewrite} matched no layers")
+        layer_count = len([line for line in out_body if line.strip()])
+        return "\n".join([magic, f"{layer_count} {blob_count + inserted}", *out_body]) + "\n"
+    raise RuntimeError(f"unknown param rewrite: {rewrite}")
+
+
+def parse_top_blobs(param_text: str) -> list[tuple[str, str, str]]:
     blobs: list[str] = []
+    layers: list[tuple[str, str, str]] = []
     seen: set[str] = set()
     for line in param_text.splitlines():
         parts = line.split()
@@ -48,30 +134,47 @@ def parse_top_blobs(param_text: str) -> list[str]:
             if blob not in seen:
                 seen.add(blob)
                 blobs.append(blob)
-    return blobs
+                layers.append((blob, parts[0], parts[1]))
+    return layers
 
 
-def make_option(vulkan: bool, args: argparse.Namespace) -> ncnn.Option:
+def precision_preset(name: str) -> PrecisionConfig:
+    presets = {
+        "safe-vk": PrecisionConfig(name, True, False, False, True, True),
+        "full-fp16-vk": PrecisionConfig(name, True, True, True, True, True),
+        "fp16-storage-only-vk": PrecisionConfig(name, True, True, False, True, True),
+        "fp16-packed-only-vk": PrecisionConfig(name, True, False, True, True, True),
+        "no-fp16-arithmetic-vk": PrecisionConfig(name, True, True, True, False, True),
+        "no-packing-layout-vk": PrecisionConfig(name, True, True, True, True, False),
+        "cpu": PrecisionConfig(name, False, True, True, True, True),
+    }
+    try:
+        return presets[name]
+    except KeyError as exc:
+        raise RuntimeError(f"unknown precision preset: {name}") from exc
+
+
+def make_option(config: PrecisionConfig, args: argparse.Namespace) -> ncnn.Option:
     opt = ncnn.Option()
     opt.num_threads = args.threads
-    opt.use_vulkan_compute = vulkan
-    opt.use_fp16_storage = args.fp16_storage
-    opt.use_fp16_packed = args.fp16_packed
-    opt.use_fp16_arithmetic = args.fp16_arithmetic
+    opt.use_vulkan_compute = config.vulkan
+    opt.use_fp16_storage = config.fp16_storage
+    opt.use_fp16_packed = config.fp16_packed
+    opt.use_fp16_arithmetic = config.fp16_arithmetic
     opt.use_bf16_storage = False
     opt.use_bf16_packed = False
     opt.use_int8_inference = False
     opt.use_int8_storage = False
     opt.use_int8_packed = False
     opt.use_int8_arithmetic = False
-    opt.use_packing_layout = args.packing_layout
+    opt.use_packing_layout = config.packing_layout
     return opt
 
 
-def load_net(param_text: str, bin_path: Path, vulkan: bool, args: argparse.Namespace) -> ncnn.Net:
+def load_net(param_text: str, bin_path: Path, config: PrecisionConfig, args: argparse.Namespace) -> ncnn.Net:
     net = ncnn.Net()
-    net.opt = make_option(vulkan, args)
-    if vulkan:
+    net.opt = make_option(config, args)
+    if config.vulkan:
         net.set_vulkan_device(args.vulkan_device)
     if net.load_param_mem(param_text) != 0:
         raise RuntimeError("load_param_mem failed")
@@ -165,11 +268,25 @@ def diff(a: np.ndarray, b: np.ndarray) -> dict[str, float]:
     rel = d / np.maximum(np.abs(bb[mask]), 1e-6)
     return {
         "finite": float(mask.sum()),
+        "nonfinite_a": float(aa.size - np.isfinite(aa).sum()),
+        "nonfinite_b": float(bb.size - np.isfinite(bb).sum()),
+        "zero_a": float((aa == 0).sum()),
+        "zero_b": float((bb == 0).sum()),
         "max_abs": float(d.max(initial=0.0)),
         "mean_abs": float(d.mean()),
         "rms_abs": float(math.sqrt(float(np.mean(d * d)))),
         "mean_rel": float(rel.mean()),
     }
+
+
+def fails_threshold(stats: dict[str, float], max_abs: float, mean_abs: float) -> bool:
+    return bool(
+        stats.get("shape_mismatch", 0.0)
+        or stats.get("nonfinite_a", 0.0)
+        or stats.get("nonfinite_b", 0.0)
+        or stats.get("max_abs", 0.0) >= max_abs
+        or stats.get("mean_abs", 0.0) >= mean_abs
+    )
 
 
 def main() -> int:
@@ -182,46 +299,63 @@ def main() -> int:
     parser.add_argument("--blob", action="append")
     parser.add_argument("--scan", action="store_true")
     parser.add_argument("--limit", type=int, default=32)
+    parser.add_argument("--max-abs-threshold", type=float, default=1e-3)
+    parser.add_argument("--mean-abs-threshold", type=float, default=1e-4)
+    parser.add_argument("--base-preset", default="safe-vk")
+    parser.add_argument("--target-preset", default="full-fp16-vk")
+    parser.add_argument("--rewrite", choices=["none", "gemm-output-fp32", "sdpa-boundary-fp32", "rmsnorm-boundary-fp32"], default="none")
     parser.add_argument("--native-sdpa", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--fp16-storage", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--fp16-packed", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--fp16-arithmetic", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--packing-layout", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--vulkan-device", type=int, default=0)
     args = parser.parse_args()
 
-    param_path, bin_path = (args.param, args.bin) if args.param and args.bin else read_component_paths(args.asset_dir, args.component)
-    raw_param = param_path.read_text()
-    param_text = rewrite_param_text(raw_param, args.native_sdpa)
     inputs = load_inputs(args)
+    base_config = precision_preset(args.base_preset)
+    target_config = precision_preset(args.target_preset)
+    if args.param:
+        base_param_path = target_param_path = args.param
+        bin_path = args.bin
+        if bin_path is None:
+            _, bin_path = read_component_paths(args.asset_dir, args.component, target_config)
+    else:
+        base_param_path, base_bin_path = read_component_paths(args.asset_dir, args.component, base_config)
+        target_param_path, target_bin_path = read_component_paths(args.asset_dir, args.component, target_config)
+        if base_bin_path != target_bin_path and args.bin is None:
+            raise RuntimeError(f"base and target bins differ: {base_bin_path} vs {target_bin_path}")
+        bin_path = args.bin or target_bin_path
+    base_param_text = apply_param_rewrite(base_param_path.read_text(), args.rewrite)
+    target_param_text = apply_param_rewrite(target_param_path.read_text(), args.rewrite)
+    if args.native_sdpa:
+        base_param_text = rewrite_custom_sdpa_to_native(base_param_text)
+        target_param_text = rewrite_custom_sdpa_to_native(target_param_text)
 
     ncnn.create_gpu_instance()
-    cpu = None
-    vk = None
+    base = None
+    target = None
     try:
-        cpu = load_net(param_text, bin_path, False, args)
-        vk = load_net(param_text, bin_path, True, args)
-        blobs = parse_top_blobs(param_text) if args.scan else (args.blob or ["out0"])
+        base = load_net(base_param_text, bin_path, base_config, args)
+        target = load_net(target_param_text, bin_path, target_config, args)
+        blobs = parse_top_blobs(target_param_text) if args.scan else [(blob, "", "") for blob in (args.blob or ["out0"])]
         printed = 0
-        for blob in blobs:
-            cpu_out = extract(cpu, inputs, blob)
-            vk_out = extract(vk, inputs, blob)
-            if cpu_out is None or vk_out is None:
+        for blob, layer_type, layer_name in blobs:
+            base_out = extract(base, inputs, blob)
+            target_out = extract(target, inputs, blob)
+            if base_out is None or target_out is None:
                 continue
-            stats = diff(vk_out, cpu_out)
-            if args.scan and stats.get("max_abs", 0.0) < 1e-3 and stats.get("mean_abs", 0.0) < 1e-4:
+            stats = diff(target_out, base_out)
+            if args.scan and not fails_threshold(stats, args.max_abs_threshold, args.mean_abs_threshold):
                 continue
-            print(f"{blob}: cpu_shape={cpu_out.shape} vk_shape={vk_out.shape} {stats}")
-            if cpu_out.size <= 8:
-                print(f"  cpu={cpu_out.reshape(-1).tolist()}")
-                print(f"  vk ={vk_out.reshape(-1).tolist()}")
+            layer = f" {layer_type}/{layer_name}" if layer_name else ""
+            print(f"{blob}:{layer} base_shape={base_out.shape} target_shape={target_out.shape} {stats}")
+            if base_out.size <= 8:
+                print(f"  base  ={base_out.reshape(-1).tolist()}")
+                print(f"  target={target_out.reshape(-1).tolist()}")
             printed += 1
             if args.scan and printed >= args.limit:
                 break
     finally:
-        cpu = None
-        vk = None
+        base = None
+        target = None
         gc.collect()
         ncnn.destroy_gpu_instance()
     return 0
