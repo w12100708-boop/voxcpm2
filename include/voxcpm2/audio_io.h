@@ -6,13 +6,29 @@
 
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
+#include <vector>
 
 #include "voxcpm2/audio.h"
 
 namespace voxcpm2 {
 
+enum class AudioFormat {
+    mp3,
+    opus,
+    aac,
+    flac,
+    wav,
+    pcm,
+};
+
 AudioBuffer read_audio_file(const std::filesystem::path& path, int target_sample_rate);
+// A target sample rate of zero preserves AudioBuffer::sample_rate.
+[[nodiscard]] std::vector<std::uint8_t> encode_audio(
+    const AudioBuffer& audio,
+    AudioFormat format,
+    int target_sample_rate = 0);
 void write_audio_file(const std::filesystem::path& path, const AudioBuffer& audio);
 
 } // namespace voxcpm2

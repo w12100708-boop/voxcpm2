@@ -39,7 +39,7 @@ COMPONENTS = [
     "audio_vae_decoder",
 ]
 
-COMPONENT_CHOICES = COMPONENTS
+DUAL_BACKEND_COMPONENTS = frozenset({"dit_estimator", "base_decoder_kv", "residual_decoder_kv", "feat_encoder"})
 
 
 def pnnx_inputshape(inputs: tuple[torch.Tensor, ...]) -> str:
@@ -217,11 +217,11 @@ def add_rmsnorm_fp32_flags(body: list[str]) -> list[str]:
         out.append(line)
 
     if fixed == 0:
-        raise RuntimeError("no RMSNorm layer found in DiT param")
+        raise RuntimeError("no RMSNorm layer found in component param")
     return out
 
 
-def normalize_dit_cpu_param_body(body: list[str]) -> list[str]:
+def normalize_cpu_param_body(body: list[str]) -> list[str]:
     out: list[str] = []
     i = 0
     restored = 0
@@ -255,11 +255,11 @@ def normalize_dit_cpu_param_body(body: list[str]) -> list[str]:
         i += 1
 
     if restored:
-        print(f"restored {restored} DiT RMSNorm adapter blocks to CPU fp32 graph")
+        print(f"restored {restored} RMSNorm adapter blocks to CPU fp32 graph")
     return out
 
 
-def make_dit_vulkan_param_body(cpu_body: list[str]) -> list[str]:
+def make_vulkan_param_body(cpu_body: list[str]) -> list[str]:
     out: list[str] = []
     fixed = 0
     for line in add_rmsnorm_fp32_flags(cpu_body):
@@ -305,7 +305,7 @@ def make_dit_vulkan_param_body(cpu_body: list[str]) -> list[str]:
         out.append(line)
 
     if fixed == 0:
-        raise RuntimeError("no RMSNorm layer found in DiT param")
+        raise RuntimeError("no RMSNorm layer found in component param")
     return out
 
 
@@ -319,9 +319,9 @@ def write_backend_params(param_path: Path, cpu_name: str, vulkan_name: str) -> N
     if len(lines) < 2 or lines[0].strip() != "7767517":
         raise RuntimeError(f"not an ncnn param file: {param_path}")
 
-    normalized_body = normalize_dit_cpu_param_body(lines[2:])
+    normalized_body = normalize_cpu_param_body(lines[2:])
     cpu_body = add_rmsnorm_fp32_flags(normalized_body)
-    vulkan_body = make_dit_vulkan_param_body(normalized_body)
+    vulkan_body = make_vulkan_param_body(normalized_body)
     write_ncnn_param(param_path.with_name(cpu_name), lines[0], cpu_body)
     write_ncnn_param(param_path.with_name(vulkan_name), lines[0], vulkan_body)
 
@@ -333,81 +333,7 @@ def write_component_backend_params(param_path: Path, name: str) -> None:
         f"{name}.cpu.ncnn.param",
         f"{name}.vulkan.ncnn.param",
     )
-
-
-def fix_dit_prefix_param(param_path: Path) -> None:
-    lines = param_path.read_text(encoding="utf-8").splitlines()
-    out: list[str] = []
-    skip_blob = None
-    for line in lines:
-        fields = line.split()
-        if fields and fields[0] == "MemoryData" and "0=512" in fields and "1=1" in fields:
-            fields = [f for f in fields if f != "1=1"]
-            line = "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
-        elif fields and fields[0] == "Concat" and fields[1] in {"cat_0", "cat_1"}:
-            fields[-1] = "0=0"
-            line = "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
-        elif fields and fields[0] == "Reshape" and "in1" in fields and "0=1024" in fields and "1=2" in fields:
-            fields = [f for f in fields if f != "2=1"]
-            line = "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
-        elif fields and fields[0] == "ExpandDims" and len(fields) >= 7 and fields[4] == "34":
-            fields[-1] = "-23303=1,0"
-            line = "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
-        elif fields and fields[0] == "Concat" and fields[1] == "cat_2":
-            if fields[3] != "1":
-                raise RuntimeError(f"unexpected dit_prefix cat_2 line: {line}")
-            skip_blob = fields[-2]
-            fields[-2] = "out0"
-            fields[-1] = "0=0"
-            line = "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
-        elif fields and fields[0] == "Squeeze" and skip_blob is not None and skip_blob in fields:
-            continue
-        out.append(line)
-
-    if skip_blob is not None and len(out) >= 2:
-        layer_count, blob_count = map(int, out[1].split()[:2])
-        out[1] = f"{layer_count - 1} {blob_count - 1}"
-    param_path.write_text("\n".join(out) + "\n", encoding="utf-8")
-
-
-def fix_dit_time_reshape_param(param_path: Path, expected: int = 3) -> None:
-    lines = param_path.read_text(encoding="utf-8").splitlines()
-    out: list[str] = []
-    fixed = 0
-    for line in lines:
-        fields = line.split()
-        if fields and fields[0] == "ExpandDims" and len(fields) >= 7:
-            if fields[4] in {"in2", "in4"} and fields[-1] == "-23303=1,1":
-                fields[0] = "Reshape"
-                fields[-1] = "0=1"
-                line = "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
-                fixed += 1
-            elif fields[-1] == "-23303=1,0":
-                fields[0] = "Reshape"
-                fields[-1:] = ["0=1024", "1=1"]
-                line = "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
-                fixed += 1
-        out.append(line)
-
-    if fixed != expected:
-        raise RuntimeError(f"expected to fix {expected} DiT time reshape ops in {param_path}, fixed {fixed}")
-    param_path.write_text("\n".join(out) + "\n", encoding="utf-8")
-
-
-def fix_dit_batch_concat_axis_param(param_path: Path) -> None:
-    lines = param_path.read_text(encoding="utf-8").splitlines()
-    out: list[str] = []
-    fixed = 0
-    for line in lines:
-        fields = line.split()
-        if fields and fields[0] == "Concat" and fields[1] in {"cat_2", "cat_3", "cat_4"} and fields[-1] == "0=0":
-            fields[-1] = "0=1"
-            line = "%-24s %-24s %s" % (fields[0], fields[1], " ".join(fields[2:]))
-            fixed += 1
-        out.append(line)
-    if fixed != 3:
-        raise RuntimeError(f"expected to fix 3 DiT batch concat axes in {param_path}, fixed {fixed}")
-    param_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    param_path.unlink()
 
 
 def add_sdpa_kvcache(param_path: Path) -> None:
@@ -533,22 +459,16 @@ def trace_module(
 
 
 def postprocess_exported_param(name: str, out_dir: Path) -> None:
-    if name == "dit_prefix":
-        fix_dit_prefix_param(out_dir / f"{name}.ncnn.param")
-        fix_dit_time_reshape_param(out_dir / f"{name}.ncnn.param")
+    param_path = out_dir / f"{name}.ncnn.param"
     if name == "dit_estimator":
-        fuse_dit_timestep_embedding_param(out_dir / f"{name}.ncnn.param")
-        force_dit_gemm_output_fp32_param(out_dir / f"{name}.ncnn.param")
-        rename_dit_sdpa_param(out_dir / f"{name}.ncnn.param")
-        write_component_backend_params(out_dir / f"{name}.ncnn.param", name)
-    if name == "base_decoder_kv":
-        add_sdpa_kvcache(out_dir / f"{name}.ncnn.param")
-        write_component_backend_params(out_dir / f"{name}.ncnn.param", name)
-    elif name == "residual_decoder_kv":
-        add_sdpa_kvcache(out_dir / f"{name}.ncnn.param")
-        write_component_backend_params(out_dir / f"{name}.ncnn.param", name)
-    elif name == "feat_encoder":
-        write_component_backend_params(out_dir / f"{name}.ncnn.param", name)
+        fuse_dit_timestep_embedding_param(param_path)
+        force_dit_gemm_output_fp32_param(param_path)
+        rename_dit_sdpa_param(param_path)
+    elif name in {"base_decoder_kv", "residual_decoder_kv"}:
+        add_sdpa_kvcache(param_path)
+
+    if name in DUAL_BACKEND_COMPONENTS:
+        write_component_backend_params(param_path, name)
 
 
 def cleanup_intermediates(name: str, out_dir: Path) -> None:
@@ -571,138 +491,6 @@ class TextEmbed(nn.Module):
 
     def forward(self, ids):
         return (self.embed(ids) * self.scale).squeeze(0)
-
-
-class Decoder(nn.Module):
-    def __init__(self, lm):
-        super().__init__()
-        self.lm = lm
-
-    def forward(self, inputs_embeds):
-        hidden, _ = self.lm(inputs_embeds=inputs_embeds, is_causal=True)
-        return hidden
-
-
-def decoder_forward_with_mask(lm, inputs_embeds, attn_mask):
-    if lm.rope_emb is not None:
-        position_ids = torch.arange(0, inputs_embeds.size(1), dtype=torch.long, device=inputs_embeds.device)
-        position_emb = lm.rope_emb(position_ids)
-    else:
-        position_emb = None
-
-    hidden_states = inputs_embeds
-    for decoder_layer in lm.layers:
-        residual = hidden_states
-        normed = decoder_layer.input_layernorm(hidden_states)
-        attn = decoder_layer.self_attn
-        bsz, q_len, _ = normed.size()
-
-        query_states = attn.q_proj(normed)
-        key_states = attn.k_proj(normed)
-        value_states = attn.v_proj(normed)
-
-        query_states = query_states.view(bsz, q_len, attn.num_heads, attn.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
-
-        if position_emb is not None:
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, *position_emb)
-
-        attn_output = F.scaled_dot_product_attention(
-            query_states.contiguous(),
-            key_states.contiguous(),
-            value_states.contiguous(),
-            attn_mask=attn_mask,
-            enable_gqa=True,
-        )
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, attn.num_heads * attn.head_dim)
-        attn_output = attn.o_proj(attn_output)
-
-        if decoder_layer.use_mup:
-            hidden_states = residual + attn_output * (
-                decoder_layer.scale_depth / (decoder_layer.num_hidden_layers**0.5)
-            )
-        else:
-            hidden_states = residual + attn_output
-
-        residual = hidden_states
-        hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
-        hidden_states = decoder_layer.mlp(hidden_states)
-        if decoder_layer.use_mup:
-            hidden_states = residual + hidden_states * (
-                decoder_layer.scale_depth / (decoder_layer.num_hidden_layers**0.5)
-            )
-        else:
-            hidden_states = residual + hidden_states
-
-    return lm.norm(hidden_states)
-
-
-class MaskedDecoder(nn.Module):
-    def __init__(self, lm):
-        super().__init__()
-        self.lm = lm
-
-    def forward(self, inputs_embeds, attn_mask):
-        return decoder_forward_with_mask(self.lm, inputs_embeds, attn_mask)
-
-
-class DecoderStep(nn.Module):
-    def __init__(self, lm):
-        super().__init__()
-        self.lm = lm
-
-    def forward(self, inputs_embeds, attn_mask, cos=None, sin=None):
-        hidden_states = inputs_embeds
-        position_emb = None if self.lm.rope_emb is None else (cos, sin)
-
-        for decoder_layer in self.lm.layers:
-            residual = hidden_states
-            normed = decoder_layer.input_layernorm(hidden_states)
-            attn = decoder_layer.self_attn
-            bsz, _ = normed.size()
-
-            query_states = attn.q_proj(normed)
-            key_states = attn.k_proj(normed)
-            value_states = attn.v_proj(normed)
-
-            query_states = query_states.view(bsz, 1, attn.num_heads, attn.head_dim).transpose(1, 2)
-            key_states = key_states.view(bsz, 1, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
-            value_states = value_states.view(bsz, 1, attn.num_key_value_heads, attn.head_dim).transpose(1, 2)
-
-            if position_emb is not None:
-                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, *position_emb)
-
-            attn_output = F.scaled_dot_product_attention(
-                query_states.contiguous(),
-                key_states.contiguous(),
-                value_states.contiguous(),
-                attn_mask=attn_mask,
-                enable_gqa=True,
-            )
-            attn_output = attn_output.transpose(1, 2).contiguous()
-            attn_output = attn_output.reshape(bsz, attn.num_heads * attn.head_dim)
-            attn_output = attn.o_proj(attn_output)
-
-            if decoder_layer.use_mup:
-                hidden_states = residual + attn_output * (
-                    decoder_layer.scale_depth / (decoder_layer.num_hidden_layers**0.5)
-                )
-            else:
-                hidden_states = residual + attn_output
-
-            residual = hidden_states
-            hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
-            hidden_states = decoder_layer.mlp(hidden_states)
-            if decoder_layer.use_mup:
-                hidden_states = residual + hidden_states * (
-                    decoder_layer.scale_depth / (decoder_layer.num_hidden_layers**0.5)
-                )
-            else:
-                hidden_states = residual + hidden_states
-
-        return self.lm.norm(hidden_states)
 
 
 class DecoderKv(nn.Module):
@@ -901,102 +689,6 @@ class DitEstimator(nn.Module):
         return out.reshape(out.size(0), -1)
 
 
-class DitPrefix(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.estimator = model.feat_decoder.estimator
-
-    def forward(self, x, mu, t, cond, dt):
-        x = self.estimator.in_proj(x.transpose(1, 2).contiguous())
-        cond = self.estimator.cond_proj(cond.transpose(1, 2).contiguous())
-        t = self.estimator.time_mlp(self.estimator.time_embeddings(t).to(x.dtype))
-        dt = self.estimator.delta_time_mlp(self.estimator.time_embeddings(dt).to(x.dtype))
-        t = t + dt
-        mu = mu.view(x.size(0), -1, x.size(-1))
-        return torch.cat([mu, t.unsqueeze(1), cond, x], dim=1).squeeze(0)
-
-
-class DitCore(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.estimator = model.feat_decoder.estimator
-
-    def forward(self, hidden):
-        hidden = hidden.unsqueeze(0)
-        out, _ = self.estimator.decoder(inputs_embeds=hidden, is_causal=False)
-        out = out[:, 7:, :]
-        out = self.estimator.out_proj(out)
-        return out.transpose(1, 2).contiguous().reshape(out.size(0), -1)
-
-
-class DitLayer(nn.Module):
-    def __init__(self, model, layer_index: int):
-        super().__init__()
-        self.decoder = model.feat_decoder.estimator.decoder
-        layer = self.decoder.layers[layer_index]
-        self.input_layernorm = layer.input_layernorm
-        self.post_attention_layernorm = layer.post_attention_layernorm
-        self.q_proj = layer.self_attn.q_proj
-        self.k_proj = layer.self_attn.k_proj
-        self.v_proj = layer.self_attn.v_proj
-        self.o_proj = layer.self_attn.o_proj
-        self.mlp = layer.mlp
-        self.num_heads = layer.self_attn.num_heads
-        self.num_key_value_heads = layer.self_attn.num_key_value_heads
-        self.head_dim = layer.self_attn.head_dim
-        self.use_mup = layer.use_mup
-        self.scale_depth = layer.scale_depth
-        self.num_hidden_layers = layer.num_hidden_layers
-
-    def forward(self, hidden):
-        position_ids = torch.arange(0, hidden.size(0), dtype=torch.long, device=hidden.device)
-        position_emb = self.decoder.rope_emb(position_ids)
-        residual = hidden
-        normed = self.input_layernorm(hidden)
-        q = self.q_proj(normed)
-        k = self.k_proj(normed)
-        v = self.v_proj(normed)
-        q = q.view(1, hidden.size(0), self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(1, hidden.size(0), self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        v = v.view(1, hidden.size(0), self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        q, k = apply_rotary_pos_emb(q, k, *position_emb)
-        attn_out = F.scaled_dot_product_attention(
-            q.contiguous(),
-            k.contiguous(),
-            v.contiguous(),
-            attn_mask=None,
-            enable_gqa=True,
-        )
-        attn_out = attn_out.transpose(1, 2).contiguous().reshape(hidden.size(0), self.num_heads * self.head_dim)
-        attn_out = self.o_proj(attn_out)
-        if self.use_mup:
-            hidden = residual + attn_out * (self.scale_depth / (self.num_hidden_layers**0.5))
-        else:
-            hidden = residual + attn_out
-
-        residual = hidden
-        hidden = self.post_attention_layernorm(hidden)
-        hidden = self.mlp(hidden)
-        if self.use_mup:
-            hidden = residual + hidden * (self.scale_depth / (self.num_hidden_layers**0.5))
-        else:
-            hidden = residual + hidden
-        return hidden
-
-
-class DitOut(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.estimator = model.feat_decoder.estimator
-
-    def forward(self, hidden):
-        hidden = hidden.unsqueeze(0)
-        out = self.estimator.decoder.norm(hidden)
-        out = out[:, 7:, :]
-        out = self.estimator.out_proj(out)
-        return out.transpose(1, 2).contiguous().reshape(out.size(0), -1)
-
-
 class AudioVaeEncoder(nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -1023,16 +715,9 @@ def make_decoder_mask(decoder_len: int) -> torch.Tensor:
     return mask
 
 
-def component_module(model, name: str, decoder_len: int, masked_decoder: bool) -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
+def component_module(model, name: str, decoder_len: int) -> tuple[nn.Module, tuple[torch.Tensor, ...]]:
     if name == "text_embed":
         return TextEmbed(model), (torch.randint(0, 512, (1, 4), dtype=torch.long),)
-    if name == "base_decoder":
-        if masked_decoder:
-            return (
-                MaskedDecoder(model.base_lm),
-                (torch.randn(1, decoder_len, model.config.lm_config.hidden_size), make_decoder_mask(decoder_len)),
-            )
-        return Decoder(model.base_lm), (torch.randn(1, decoder_len, model.config.lm_config.hidden_size),)
     if name == "base_decoder_kv":
         return (
             DecoderKv(model.base_lm),
@@ -1043,13 +728,6 @@ def component_module(model, name: str, decoder_len: int, masked_decoder: bool) -
                 torch.randn(decoder_len, HEAD_DIM),
             ),
         )
-    if name == "residual_decoder":
-        if masked_decoder:
-            return (
-                MaskedDecoder(model.residual_lm),
-                (torch.randn(1, decoder_len, model.config.lm_config.hidden_size), make_decoder_mask(decoder_len)),
-            )
-        return Decoder(model.residual_lm), (torch.randn(1, decoder_len, model.config.lm_config.hidden_size),)
     if name == "residual_decoder_kv":
         return (
             DecoderKv(model.residual_lm),
@@ -1079,24 +757,6 @@ def component_module(model, name: str, decoder_len: int, masked_decoder: bool) -
                 torch.zeros(2),
             ),
         )
-    if name == "dit_prefix":
-        return (
-            DitPrefix(model),
-            (
-                torch.randn(1, model.feat_dim, model.patch_size),
-                torch.randn(1, 2048),
-                torch.rand(1),
-                torch.randn(1, model.feat_dim, model.patch_size),
-                torch.zeros(1),
-            ),
-        )
-    if name == "dit_core":
-        return DitCore(model), (torch.randn(11, 1024),)
-    if name.startswith("dit_layer_"):
-        layer_index = int(name.rsplit("_", 1)[1])
-        return DitLayer(model, layer_index), (torch.randn(11, 1024),)
-    if name == "dit_out":
-        return DitOut(model), (torch.randn(11, 1024),)
     if name == "audio_vae_encoder":
         length = model.patch_size * model.chunk_size * 2
         return AudioVaeEncoder(model), (torch.randn(1, length),)
@@ -1129,7 +789,6 @@ def update_manifest(asset_dir: Path, exported: list[str], decoder_len: int) -> N
     manifest["format_version"] = 2
     current_params = manifest.get("params", {})
     exported_set = set(exported)
-    dual_backend_components = {"dit_estimator", "base_decoder_kv", "residual_decoder_kv", "feat_encoder"}
     allowed = [
         name
         for name in COMPONENTS
@@ -1137,12 +796,12 @@ def update_manifest(asset_dir: Path, exported: list[str], decoder_len: int) -> N
         or name in current_params
         or any(
             name == comp and (f"{comp}.cpu" in current_params or f"{comp}.vulkan" in current_params)
-            for comp in dual_backend_components
+            for comp in DUAL_BACKEND_COMPONENTS
         )
     ]
     params: dict[str, dict[str, str]] = {}
     for name in allowed:
-        if name in dual_backend_components:
+        if name in DUAL_BACKEND_COMPONENTS:
             params[f"{name}.cpu"] = {
                 "param": f"{name}.cpu.ncnn.param",
                 "bin": f"{name}.ncnn.bin",
@@ -1174,7 +833,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Export VoxCPM2 component ncnn graphs for voxcpm2-ncnn.")
     parser.add_argument("--model-id", default="openbmb/VoxCPM2")
     parser.add_argument("--asset-dir", type=Path, default=Path("assets/voxcpm2"))
-    parser.add_argument("--components", nargs="+", default=COMPONENTS, choices=COMPONENT_CHOICES)
+    parser.add_argument("--components", nargs="+", default=COMPONENTS, choices=COMPONENTS)
     parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--update-manifest", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--keep-intermediates", action="store_true")
@@ -1229,7 +888,7 @@ def main() -> None:
     exported: list[str] = []
     for name in args.components:
         print(f"exporting {name}", flush=True)
-        module, inputs = component_module(model, name, 4, False)
+        module, inputs = component_module(model, name, 4)
         inputs2 = component_shape2_inputs(model, name)
         inputshape = pnnx_inputshape(inputs)
         inputshape2 = pnnx_inputshape(inputs2) if inputs2 is not None else None

@@ -12,6 +12,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -46,6 +47,38 @@ using codec_context_ptr = av_ptr<AVCodecContext, avcodec_free_context>;
 using frame_ptr = av_ptr<AVFrame, av_frame_free>;
 using packet_ptr = av_ptr<AVPacket, av_packet_free>;
 using swr_ptr = av_ptr<SwrContext, swr_free>;
+
+struct FormatOutputDeleter {
+    void operator()(AVFormatContext* context) const {
+        avformat_free_context(context);
+    }
+};
+
+using format_output_ptr = std::unique_ptr<AVFormatContext, FormatOutputDeleter>;
+
+const char* muxer_name(AudioFormat format) {
+    switch (format) {
+    case AudioFormat::mp3:
+        return "mp3";
+    case AudioFormat::opus:
+        return "opus";
+    case AudioFormat::aac:
+        return "adts";
+    case AudioFormat::flac:
+        return "flac";
+    case AudioFormat::wav:
+        return "wav";
+    case AudioFormat::pcm:
+        return "s16le";
+    }
+    throw std::runtime_error("unsupported audio format");
+}
+
+void validate_audio(const AudioBuffer& audio) {
+    if (audio.sample_rate <= 0 or audio.channels != 1 or audio.samples.empty()) [[unlikely]] {
+        throw std::runtime_error("only non-empty mono float audio can be encoded");
+    }
+}
 
 bool sample_format_supported(const AVCodec* codec, AVSampleFormat format) {
     if (codec->sample_fmts == nullptr) {
@@ -122,6 +155,206 @@ void encode_and_write(AVFormatContext* format, AVCodecContext* codec, AVFrame* f
         }
     }
 }
+
+void encode_audio_to_context(
+    AVFormatContext* format,
+    const AudioBuffer& audio,
+    int target_sample_rate,
+    std::string_view destination) {
+    if (format->oformat->audio_codec == AV_CODEC_ID_NONE) [[unlikely]] {
+        throw std::runtime_error(std::format("output format has no default audio codec: {}", destination));
+    }
+    const AVCodec* encoder = avcodec_find_encoder(format->oformat->audio_codec);
+    if (encoder == nullptr) [[unlikely]] {
+        throw std::runtime_error(std::format("cannot find encoder for {}", destination));
+    }
+
+    AVStream* stream = avformat_new_stream(format, nullptr);
+    if (stream == nullptr) [[unlikely]] {
+        throw std::runtime_error("failed to create audio stream");
+    }
+
+    codec_context_ptr codec(avcodec_alloc_context3(encoder));
+    if (not codec) [[unlikely]] {
+        throw std::runtime_error("failed to allocate ffmpeg encoder context");
+    }
+    av_channel_layout_default(&codec->ch_layout, 1);
+    codec->sample_fmt = choose_sample_format(encoder);
+    codec->sample_rate = choose_sample_rate(encoder, target_sample_rate);
+    codec->time_base = AVRational{1, codec->sample_rate};
+    codec->bit_rate = 192000;
+    if ((format->oformat->flags & AVFMT_GLOBALHEADER) != 0) {
+        codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+
+    int ret = avcodec_open2(codec.get(), encoder, nullptr);
+    if (ret < 0) [[unlikely]] {
+        throw_ffmpeg(ret, "cannot open encoder");
+    }
+    ret = avcodec_parameters_from_context(stream->codecpar, codec.get());
+    if (ret < 0) [[unlikely]] {
+        throw_ffmpeg(ret, "cannot copy encoder parameters");
+    }
+    stream->time_base = codec->time_base;
+
+    ret = avformat_write_header(format, nullptr);
+    if (ret < 0) [[unlikely]] {
+        throw_ffmpeg(ret, "cannot write output header");
+    }
+
+    AVChannelLayout input_layout;
+    av_channel_layout_default(&input_layout, 1);
+    SwrContext* raw_swr = nullptr;
+    ret = swr_alloc_set_opts2(
+        &raw_swr,
+        &codec->ch_layout,
+        codec->sample_fmt,
+        codec->sample_rate,
+        &input_layout,
+        AV_SAMPLE_FMT_FLT,
+        audio.sample_rate,
+        0,
+        nullptr);
+    av_channel_layout_uninit(&input_layout);
+    if (ret < 0) [[unlikely]] {
+        throw_ffmpeg(ret, "cannot allocate encoder resampler");
+    }
+    swr_ptr swr(raw_swr);
+    ret = swr_init(swr.get());
+    if (ret < 0) [[unlikely]] {
+        throw_ffmpeg(ret, "cannot initialize encoder resampler");
+    }
+
+    const int input_chunk = codec->frame_size > 0 ? codec->frame_size : 1024;
+    std::size_t offset = 0;
+    std::int64_t pts = 0;
+    while (offset < audio.samples.size()) {
+        const int in_count = std::min<int>(input_chunk, static_cast<int>(audio.samples.size() - offset));
+        const int out_count = static_cast<int>(av_rescale_rnd(
+            swr_get_delay(swr.get(), audio.sample_rate) + in_count,
+            codec->sample_rate,
+            audio.sample_rate,
+            AV_ROUND_UP));
+
+        frame_ptr frame(av_frame_alloc());
+        if (not frame) [[unlikely]] {
+            throw std::runtime_error("failed to allocate encode frame");
+        }
+        frame->nb_samples = out_count;
+        frame->format = codec->sample_fmt;
+        frame->sample_rate = codec->sample_rate;
+        ret = av_channel_layout_copy(&frame->ch_layout, &codec->ch_layout);
+        if (ret < 0) [[unlikely]] {
+            throw_ffmpeg(ret, "cannot copy frame channel layout");
+        }
+        ret = av_frame_get_buffer(frame.get(), 0);
+        if (ret < 0) [[unlikely]] {
+            throw_ffmpeg(ret, "cannot allocate encode frame buffer");
+        }
+
+        const auto* in_data = reinterpret_cast<const std::uint8_t*>(audio.samples.data() + offset);
+        const int converted = swr_convert(swr.get(), frame->data, out_count, &in_data, in_count);
+        if (converted < 0) [[unlikely]] {
+            throw_ffmpeg(converted, "failed to convert audio for encoder");
+        }
+        frame->nb_samples = converted;
+        frame->pts = pts;
+        pts += converted;
+        if (converted > 0) {
+            encode_and_write(format, codec.get(), frame.get());
+        }
+        offset += static_cast<std::size_t>(in_count);
+    }
+
+    while (true) {
+        const int out_count = static_cast<int>(av_rescale_rnd(
+            swr_get_delay(swr.get(), audio.sample_rate),
+            codec->sample_rate,
+            audio.sample_rate,
+            AV_ROUND_UP));
+        if (out_count <= 0) {
+            break;
+        }
+        frame_ptr frame(av_frame_alloc());
+        if (not frame) [[unlikely]] {
+            throw std::runtime_error("failed to allocate flush frame");
+        }
+        frame->nb_samples = out_count;
+        frame->format = codec->sample_fmt;
+        frame->sample_rate = codec->sample_rate;
+        ret = av_channel_layout_copy(&frame->ch_layout, &codec->ch_layout);
+        if (ret < 0) [[unlikely]] {
+            throw_ffmpeg(ret, "cannot copy flush frame channel layout");
+        }
+        ret = av_frame_get_buffer(frame.get(), 0);
+        if (ret < 0) [[unlikely]] {
+            throw_ffmpeg(ret, "cannot allocate flush frame buffer");
+        }
+        const int converted = swr_convert(swr.get(), frame->data, out_count, nullptr, 0);
+        if (converted < 0) [[unlikely]] {
+            throw_ffmpeg(converted, "failed to flush encoder resampler");
+        }
+        if (converted == 0) {
+            break;
+        }
+        frame->nb_samples = converted;
+        frame->pts = pts;
+        pts += converted;
+        encode_and_write(format, codec.get(), frame.get());
+    }
+
+    encode_and_write(format, codec.get(), nullptr);
+    ret = av_write_trailer(format);
+    if (ret < 0) [[unlikely]] {
+        throw_ffmpeg(ret, "cannot write output trailer");
+    }
+}
+
+class DynamicOutputBuffer {
+public:
+    explicit DynamicOutputBuffer(AVFormatContext* format) : format_(format) {
+        const int ret = avio_open_dyn_buf(&format_->pb);
+        if (ret < 0) [[unlikely]] {
+            throw_ffmpeg(ret, "cannot open in-memory audio output");
+        }
+    }
+
+    ~DynamicOutputBuffer() {
+        discard();
+    }
+
+    DynamicOutputBuffer(const DynamicOutputBuffer&) = delete;
+    DynamicOutputBuffer& operator=(const DynamicOutputBuffer&) = delete;
+
+    std::vector<std::uint8_t> finish() {
+        std::uint8_t* raw_buffer = nullptr;
+        const int size = avio_close_dyn_buf(format_->pb, &raw_buffer);
+        format_->pb = nullptr;
+        if (size < 0) [[unlikely]] {
+            av_free(raw_buffer);
+            throw_ffmpeg(size, "cannot close in-memory audio output");
+        }
+        std::vector<std::uint8_t> output;
+        if (size > 0) {
+            output.assign(raw_buffer, raw_buffer + size);
+        }
+        av_free(raw_buffer);
+        return output;
+    }
+
+private:
+    void discard() noexcept {
+        if (format_ == nullptr or format_->pb == nullptr) {
+            return;
+        }
+        std::uint8_t* raw_buffer = nullptr;
+        avio_close_dyn_buf(format_->pb, &raw_buffer);
+        format_->pb = nullptr;
+        av_free(raw_buffer);
+    }
+
+    AVFormatContext* format_ = nullptr;
+};
 
 } // namespace
 
@@ -250,10 +483,30 @@ AudioBuffer read_audio_file(const std::filesystem::path& path, int target_sample
     return AudioBuffer{.sample_rate = target_sample_rate, .channels = 1, .samples = std::move(samples)};
 }
 
-void write_audio_file(const std::filesystem::path& path, const AudioBuffer& audio) {
-    if (audio.sample_rate <= 0 or audio.channels != 1 or audio.samples.empty()) [[unlikely]] {
-        throw std::runtime_error("only non-empty mono float audio can be encoded");
+std::vector<std::uint8_t> encode_audio(
+    const AudioBuffer& audio,
+    AudioFormat format,
+    int target_sample_rate) {
+    validate_audio(audio);
+    if (target_sample_rate < 0) [[unlikely]] {
+        throw std::runtime_error("target sample rate must not be negative");
     }
+    const int output_sample_rate = target_sample_rate == 0 ? audio.sample_rate : target_sample_rate;
+
+    AVFormatContext* raw_format = nullptr;
+    const char* output_muxer = muxer_name(format);
+    const int ret = avformat_alloc_output_context2(&raw_format, nullptr, output_muxer, nullptr);
+    if (ret < 0 or raw_format == nullptr) [[unlikely]] {
+        throw_ffmpeg(ret < 0 ? ret : AVERROR(EINVAL), std::format("cannot create {} audio output", output_muxer));
+    }
+    format_output_ptr output(raw_format);
+    DynamicOutputBuffer buffer(output.get());
+    encode_audio_to_context(output.get(), audio, output_sample_rate, output_muxer);
+    return buffer.finish();
+}
+
+void write_audio_file(const std::filesystem::path& path, const AudioBuffer& audio) {
+    validate_audio(audio);
 
     AVFormatContext* raw_format = nullptr;
     int ret = avformat_alloc_output_context2(&raw_format, nullptr, nullptr, path.string().c_str());
@@ -270,160 +523,13 @@ void write_audio_file(const std::filesystem::path& path, const AudioBuffer& audi
                     })>
         format(raw_format);
 
-    if (format->oformat->audio_codec == AV_CODEC_ID_NONE) [[unlikely]] {
-        throw std::runtime_error("output format has no default audio codec: " + path.string());
-    }
-    const AVCodec* encoder = avcodec_find_encoder(format->oformat->audio_codec);
-    if (encoder == nullptr) [[unlikely]] {
-        throw std::runtime_error("cannot find encoder for " + path.string());
-    }
-
-    AVStream* stream = avformat_new_stream(format.get(), nullptr);
-    if (stream == nullptr) [[unlikely]] {
-        throw std::runtime_error("failed to create audio stream");
-    }
-
-    codec_context_ptr codec(avcodec_alloc_context3(encoder));
-    if (not codec) [[unlikely]] {
-        throw std::runtime_error("failed to allocate ffmpeg encoder context");
-    }
-    av_channel_layout_default(&codec->ch_layout, 1);
-    codec->sample_fmt = choose_sample_format(encoder);
-    codec->sample_rate = choose_sample_rate(encoder, audio.sample_rate);
-    codec->time_base = AVRational{1, codec->sample_rate};
-    codec->bit_rate = 192000;
-    if ((format->oformat->flags & AVFMT_GLOBALHEADER) != 0) {
-        codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    }
-
-    ret = avcodec_open2(codec.get(), encoder, nullptr);
-    if (ret < 0) [[unlikely]] {
-        throw_ffmpeg(ret, "cannot open encoder");
-    }
-    ret = avcodec_parameters_from_context(stream->codecpar, codec.get());
-    if (ret < 0) [[unlikely]] {
-        throw_ffmpeg(ret, "cannot copy encoder parameters");
-    }
-    stream->time_base = codec->time_base;
-
     if ((format->oformat->flags & AVFMT_NOFILE) == 0) {
         ret = avio_open(&format->pb, path.string().c_str(), AVIO_FLAG_WRITE);
         if (ret < 0) [[unlikely]] {
             throw_ffmpeg(ret, "cannot open audio output " + path.string());
         }
     }
-
-    ret = avformat_write_header(format.get(), nullptr);
-    if (ret < 0) [[unlikely]] {
-        throw_ffmpeg(ret, "cannot write output header");
-    }
-
-    AVChannelLayout input_layout;
-    av_channel_layout_default(&input_layout, 1);
-    SwrContext* raw_swr = nullptr;
-    ret = swr_alloc_set_opts2(
-        &raw_swr,
-        &codec->ch_layout,
-        codec->sample_fmt,
-        codec->sample_rate,
-        &input_layout,
-        AV_SAMPLE_FMT_FLT,
-        audio.sample_rate,
-        0,
-        nullptr);
-    av_channel_layout_uninit(&input_layout);
-    if (ret < 0) [[unlikely]] {
-        throw_ffmpeg(ret, "cannot allocate encoder resampler");
-    }
-    swr_ptr swr(raw_swr);
-    ret = swr_init(swr.get());
-    if (ret < 0) [[unlikely]] {
-        throw_ffmpeg(ret, "cannot initialize encoder resampler");
-    }
-
-    const int input_chunk = codec->frame_size > 0 ? codec->frame_size : 1024;
-    std::size_t offset = 0;
-    std::int64_t pts = 0;
-    while (offset < audio.samples.size()) {
-        const int in_count = std::min<int>(input_chunk, static_cast<int>(audio.samples.size() - offset));
-        const int out_count = static_cast<int>(av_rescale_rnd(
-            swr_get_delay(swr.get(), audio.sample_rate) + in_count,
-            codec->sample_rate,
-            audio.sample_rate,
-            AV_ROUND_UP));
-
-        frame_ptr frame(av_frame_alloc());
-        if (not frame) [[unlikely]] {
-            throw std::runtime_error("failed to allocate encode frame");
-        }
-        frame->nb_samples = out_count;
-        frame->format = codec->sample_fmt;
-        frame->sample_rate = codec->sample_rate;
-        ret = av_channel_layout_copy(&frame->ch_layout, &codec->ch_layout);
-        if (ret < 0) [[unlikely]] {
-            throw_ffmpeg(ret, "cannot copy frame channel layout");
-        }
-        ret = av_frame_get_buffer(frame.get(), 0);
-        if (ret < 0) [[unlikely]] {
-            throw_ffmpeg(ret, "cannot allocate encode frame buffer");
-        }
-
-        const auto* in_data = reinterpret_cast<const std::uint8_t*>(audio.samples.data() + offset);
-        const int converted = swr_convert(swr.get(), frame->data, out_count, &in_data, in_count);
-        if (converted < 0) [[unlikely]] {
-            throw_ffmpeg(converted, "failed to convert audio for encoder");
-        }
-        frame->nb_samples = converted;
-        frame->pts = pts;
-        pts += converted;
-        if (converted > 0) {
-            encode_and_write(format.get(), codec.get(), frame.get());
-        }
-        offset += static_cast<std::size_t>(in_count);
-    }
-
-    while (true) {
-        const int out_count = static_cast<int>(av_rescale_rnd(
-            swr_get_delay(swr.get(), audio.sample_rate),
-            codec->sample_rate,
-            audio.sample_rate,
-            AV_ROUND_UP));
-        if (out_count <= 0) {
-            break;
-        }
-        frame_ptr frame(av_frame_alloc());
-        if (not frame) [[unlikely]] {
-            throw std::runtime_error("failed to allocate flush frame");
-        }
-        frame->nb_samples = out_count;
-        frame->format = codec->sample_fmt;
-        frame->sample_rate = codec->sample_rate;
-        ret = av_channel_layout_copy(&frame->ch_layout, &codec->ch_layout);
-        if (ret < 0) [[unlikely]] {
-            throw_ffmpeg(ret, "cannot copy flush frame channel layout");
-        }
-        ret = av_frame_get_buffer(frame.get(), 0);
-        if (ret < 0) [[unlikely]] {
-            throw_ffmpeg(ret, "cannot allocate flush frame buffer");
-        }
-        const int converted = swr_convert(swr.get(), frame->data, out_count, nullptr, 0);
-        if (converted < 0) [[unlikely]] {
-            throw_ffmpeg(converted, "failed to flush encoder resampler");
-        }
-        if (converted == 0) {
-            break;
-        }
-        frame->nb_samples = converted;
-        frame->pts = pts;
-        pts += converted;
-        encode_and_write(format.get(), codec.get(), frame.get());
-    }
-
-    encode_and_write(format.get(), codec.get(), nullptr);
-    ret = av_write_trailer(format.get());
-    if (ret < 0) [[unlikely]] {
-        throw_ffmpeg(ret, "cannot write output trailer");
-    }
+    encode_audio_to_context(format.get(), audio, audio.sample_rate, path.string());
 }
 
 } // namespace voxcpm2

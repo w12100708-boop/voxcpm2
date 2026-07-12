@@ -220,7 +220,7 @@ int main(int argc, char** argv) {
     app.add_option("--prompt", cli.prompt, "Prompt text for continuation");
     app.add_option("--prompt-audio", cli.prompt_audio, "Prompt audio path for continuation");
     app.add_option("--reference-audio", cli.reference_audio, "Reference audio path for voice cloning");
-    app.add_option("--min-patches", cli.min_patches, "Minimum generated latent patches before honoring stop token")
+    app.add_option("--min-patches", cli.min_patches, "Upstream min_len threshold; stop is honored when step > value")
         ->capture_default_str();
     app.add_option("--timesteps", cli.timesteps, "CFM Euler steps per generated patch")->capture_default_str();
     app.add_option("--cfg-value", cli.cfg_value, "Classifier-free guidance value")->capture_default_str();
@@ -229,7 +229,7 @@ int main(int argc, char** argv) {
     app.add_flag("--vulkan", cli.vulkan, "Enable Vulkan compute");
     app.add_flag("--no-progress", cli.no_progress, "Disable synthesis progress bars");
 #ifdef VOXCPM2_ENABLE_PROFILE
-    app.add_flag("--profile", cli.profile, "Print coarse synthesis timing to stderr");
+    app.add_flag("--profile", cli.profile, "Print synthesis timing summary to stderr");
 #endif
     app.add_flag("--smoke-components", cli.smoke_components, "Run exported component smoke checks");
     app.add_flag("--tokenize", cli.tokenize, "Print token ids for --text and exit");

@@ -8,11 +8,11 @@
 
 #include <array>
 #include <cstring>
-#include <format>
+#include <initializer_list>
 #include <print>
+#include <span>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include <mat.h>
@@ -20,31 +20,8 @@
 
 namespace voxcpm2::runtime {
 
-// Components with separate .cpu/.vulkan param variants that run fp16 on Vulkan
-// via VoxCPM2DTypeAdapter-wrapped RMSNorm, and stay fp32 on CPU.
-inline constexpr std::array<const char*, 4> kDualBackendComponents = {
-    "dit_estimator", "base_decoder_kv", "residual_decoder_kv", "feat_encoder",
-};
-
-constexpr bool is_dual_backend_component(std::string_view name) {
-    for (auto* c : kDualBackendComponents) {
-        if (name == c) {
-            return true;
-        }
-    }
-    return false;
-}
-
-inline std::string resolve_param_key(const std::string& name, bool use_vulkan) {
-    if (is_dual_backend_component(name)) {
-        return use_vulkan ? name + ".vulkan" : name + ".cpu";
-    }
-    return name;
-}
-
 inline ncnn::Mat make_i64_input(int w, int h) {
     ncnn::Mat mat(w, h, std::size_t{8});
-    std::memset(mat.data, 0, mat.total() * mat.elemsize);
     auto* p = static_cast<long long*>(mat.data);
     for (int i = 0; i < w * h; ++i) {
         p[i] = (i % 2 == 0) ? 1 : 0;
@@ -58,11 +35,14 @@ inline ncnn::Mat make_i32_input(const std::vector<int>& values) {
     return mat;
 }
 
-inline ncnn::Mat make_f32_input(const std::vector<float>& values) {
+inline ncnn::Mat make_f32_input(std::span<const float> values) {
     ncnn::Mat mat(static_cast<int>(values.size()));
-    std::memset(mat.data, 0, mat.total() * mat.elemsize);
     std::memcpy(mat.data, values.data(), values.size() * sizeof(float));
     return mat;
+}
+
+inline ncnn::Mat make_f32_input(const std::vector<float>& values) {
+    return make_f32_input(std::span<const float>(values));
 }
 
 inline ncnn::Mat make_f32_input(int w, int h, int c = 1) {
@@ -79,7 +59,6 @@ inline ncnn::Mat make_f32_mat(int w, int h, const std::vector<float>& values) {
         throw std::runtime_error("make_f32_mat size mismatch");
     }
     ncnn::Mat mat(w, h);
-    std::memset(mat.data, 0, mat.total() * mat.elemsize);
     std::memcpy(mat.data, values.data(), values.size() * sizeof(float));
     return mat;
 }
@@ -89,8 +68,10 @@ inline ncnn::Mat make_f32_mat(int w, int h, int c, const std::vector<float>& val
         throw std::runtime_error("make_f32_mat size mismatch");
     }
     ncnn::Mat mat(w, h, c);
-    std::memset(mat.data, 0, mat.total() * mat.elemsize);
-    std::memcpy(mat.data, values.data(), values.size() * sizeof(float));
+    const std::size_t plane = static_cast<std::size_t>(w) * h;
+    for (int q = 0; q < c; ++q) {
+        std::memcpy(mat.channel(q), values.data() + plane * q, plane * sizeof(float));
+    }
     return mat;
 }
 
@@ -141,7 +122,9 @@ inline void print_mat_shape(const std::string& name, const ncnn::Mat& mat) {
 
 inline ncnn::Mat run_single_input(ncnn::Net& net, const ncnn::Mat& in) {
     ncnn::Extractor ex = net.create_extractor();
-    ex.input("in0", in);
+    if (ex.input("in0", in) != 0) [[unlikely]] {
+        throw std::runtime_error("failed to bind in0");
+    }
     ncnn::Mat out;
     if (ex.extract("out0", out) != 0 or out.empty()) [[unlikely]] {
         throw std::runtime_error("failed to extract out0");
@@ -149,11 +132,19 @@ inline ncnn::Mat run_single_input(ncnn::Net& net, const ncnn::Mat& in) {
     return out;
 }
 
-inline ncnn::Mat run_net(ncnn::Net& net, const std::vector<ncnn::Mat>& inputs) {
+inline ncnn::Mat run_net(ncnn::Net& net, std::initializer_list<ncnn::Mat> inputs) {
+    static constexpr std::array input_names = {"in0", "in1", "in2", "in3", "in4"};
+    if (inputs.size() > input_names.size()) [[unlikely]] {
+        throw std::runtime_error("too many component inputs");
+    }
     ncnn::Extractor ex = net.create_extractor();
-    for (std::size_t i = 0; i < inputs.size(); ++i) {
-        const std::string name = std::format("in{}", i);
-        ex.input(name.c_str(), inputs[i]);
+    std::size_t i = 0;
+    for (const ncnn::Mat& input : inputs) {
+        const char* name = input_names[i];
+        if (ex.input(name, input) != 0) [[unlikely]] {
+            throw std::runtime_error("failed to bind " + std::string(name));
+        }
+        ++i;
     }
     ncnn::Mat out;
     if (ex.extract("out0", out) != 0 or out.empty()) [[unlikely]] {
@@ -162,7 +153,7 @@ inline ncnn::Mat run_net(ncnn::Net& net, const std::vector<ncnn::Mat>& inputs) {
     return out;
 }
 
-inline std::vector<float> run_net_vec(ncnn::Net& net, const std::vector<ncnn::Mat>& inputs) {
+inline std::vector<float> run_net_vec(ncnn::Net& net, std::initializer_list<ncnn::Mat> inputs) {
     return mat_to_vector(run_net(net, inputs));
 }
 
