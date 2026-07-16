@@ -7,7 +7,8 @@ the Python exporter used to build the runtime asset directory.
 ## Build
 
 Install xmake, FFmpeg development libraries, and a Vulkan-capable ncnn build.
-The xmake project pulls ncnn and uses system FFmpeg:
+The xmake project pulls ncnn and uses system FFmpeg for the CLI/server audio
+adapter:
 
 ```sh
 xmake f -m release --profile=false
@@ -27,8 +28,10 @@ Prebuilt fp16 ncnn assets are published at:
 
 <https://huggingface.co/lyrin/voxpm2-ncnn>
 
-The runtime requires `model.json` `format_version >= 2` and the KV-cache
-decoder components `base_decoder_kv` and `residual_decoder_kv`. Older
+The runtime accepts the strict `model.json` schema at `format_version == 2` and
+requires the KV-cache decoder components `base_decoder_kv` and
+`residual_decoder_kv`. Missing or unknown manifest fields are rejected so the
+runtime and exporter schema evolve together. Older
 `base_decoder_step` / `residual_decoder_step` assets are not used by this
 runtime.
 
@@ -190,6 +193,11 @@ The public C++ API lives under `include/voxcpm2`:
 - `voxcpm2::Synthesizer` loads the ncnn asset directory and returns `AudioBuffer`.
 - `voxcpm2::read_audio_file`, `voxcpm2::encode_audio`, and
   `voxcpm2::write_audio_file` handle FFmpeg audio I/O.
+
+The `voxcpm2_ncnn` target contains the inference runtime and does not link
+FFmpeg. Link `voxcpm2_audio_ffmpeg` in addition to `voxcpm2_ncnn` when using the
+audio I/O functions. The `voxcpm2` and `voxcpm2-server` targets already link
+both libraries.
 
 ## License
 

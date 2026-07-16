@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <string>
 #include <utility>
@@ -29,6 +30,182 @@ ApiError invalid(std::string message, std::optional<std::string> param = std::nu
         .type = "invalid_request_error",
         .param = std::move(param),
     };
+}
+
+class RequestDecodeError final : public std::exception {
+public:
+    explicit RequestDecodeError(ApiError error) : error_(std::move(error)) {}
+
+    [[nodiscard]] const ApiError& error() const noexcept {
+        return error_;
+    }
+
+    [[nodiscard]] const char* what() const noexcept override {
+        return error_.message.c_str();
+    }
+
+private:
+    ApiError error_;
+};
+
+[[noreturn]] void fail_decode(std::string message, std::optional<std::string> param = std::nullopt) {
+    throw RequestDecodeError(invalid(std::move(message), std::move(param)));
+}
+
+struct VoiceInput {
+    std::string id;
+};
+
+struct SpeechRequestPayload {
+    std::string model;
+    std::string input;
+    VoiceInput voice;
+    std::optional<std::string> instructions;
+    AudioFormat response_format = AudioFormat::mp3;
+    std::optional<double> speed;
+    std::optional<std::string> stream_format;
+};
+
+struct ApiErrorBody {
+    std::string message;
+    std::string type;
+    std::optional<std::string> param;
+};
+
+struct ApiErrorEnvelope {
+    ApiErrorBody error;
+};
+
+struct HealthResponse {
+    std::string status;
+    std::string model;
+};
+
+template <std::size_t N>
+void reject_unknown_fields(const json& object, const std::array<std::string_view, N>& allowed_fields) {
+    for (const auto& [key, value] : object.items()) {
+        static_cast<void>(value);
+        if (std::ranges::find(allowed_fields, key) == allowed_fields.end()) {
+            fail_decode("unknown field: " + key, key);
+        }
+    }
+}
+
+std::string required_string(
+    const json& object,
+    const char* field,
+    std::string required_message,
+    std::string type_message) {
+    if (not object.contains(field)) {
+        fail_decode(std::move(required_message), field);
+    }
+    const json& value = object.at(field);
+    if (not value.is_string()) {
+        fail_decode(std::move(type_message), field);
+    }
+    return value.get<std::string>();
+}
+
+void from_json(const json& value, VoiceInput& voice) {
+    if (value.is_string()) {
+        voice.id = value.get<std::string>();
+        if (not voice.id.empty()) {
+            return;
+        }
+        fail_decode("voice must not be empty", "voice");
+    }
+    if (value.is_object() and value.size() == 1 and value.contains("id") and value.at("id").is_string()) {
+        voice.id = value.at("id").get<std::string>();
+        if (not voice.id.empty()) {
+            return;
+        }
+    }
+    fail_decode("voice must be a non-empty string or an object containing a non-empty id", "voice");
+}
+
+AudioFormat decode_audio_format(const json& value) {
+    if (not value.is_string()) {
+        fail_decode("response_format must be a string", "response_format");
+    }
+    const std::string format = value.get<std::string>();
+    if (format == "mp3") {
+        return AudioFormat::mp3;
+    }
+    if (format == "opus") {
+        return AudioFormat::opus;
+    }
+    if (format == "aac") {
+        return AudioFormat::aac;
+    }
+    if (format == "flac") {
+        return AudioFormat::flac;
+    }
+    if (format == "wav") {
+        return AudioFormat::wav;
+    }
+    if (format == "pcm") {
+        return AudioFormat::pcm;
+    }
+    fail_decode("response_format must be one of mp3, opus, aac, flac, wav, or pcm", "response_format");
+}
+
+void from_json(const json& request, SpeechRequestPayload& payload) {
+    constexpr std::array<std::string_view, 7> allowed_fields{
+        "model",
+        "input",
+        "voice",
+        "instructions",
+        "response_format",
+        "speed",
+        "stream_format",
+    };
+    reject_unknown_fields(request, allowed_fields);
+
+    payload.model = required_string(request, "model", "model is required", "model must be a string");
+    payload.input = required_string(request, "input", "input is required", "input must be a string");
+    if (not request.contains("voice")) {
+        fail_decode("voice is required", "voice");
+    }
+    payload.voice = request.at("voice").get<VoiceInput>();
+
+    if (request.contains("instructions")) {
+        if (not request.at("instructions").is_string()) {
+            fail_decode("instructions must be a string", "instructions");
+        }
+        payload.instructions = request.at("instructions").get<std::string>();
+    }
+    if (request.contains("response_format")) {
+        payload.response_format = decode_audio_format(request.at("response_format"));
+    }
+    if (request.contains("speed")) {
+        if (not request.at("speed").is_number()) {
+            fail_decode("speed must be a number", "speed");
+        }
+        payload.speed = request.at("speed").get<double>();
+    }
+    if (request.contains("stream_format")) {
+        if (not request.at("stream_format").is_string()) {
+            fail_decode("stream_format must be a string", "stream_format");
+        }
+        payload.stream_format = request.at("stream_format").get<std::string>();
+    }
+}
+
+void to_json(json& output, const ApiErrorBody& error) {
+    output = json{
+        {"message", error.message},
+        {"type", error.type},
+        {"param", error.param.has_value() ? json(*error.param) : json(nullptr)},
+        {"code", nullptr},
+    };
+}
+
+void to_json(json& output, const ApiErrorEnvelope& envelope) {
+    output = json{{"error", envelope.error}};
+}
+
+void to_json(json& output, const HealthResponse& health) {
+    output = json{{"status", health.status}, {"model", health.model}};
 }
 
 std::optional<std::size_t> utf8_length(std::string_view text) {
@@ -73,53 +250,33 @@ std::optional<std::size_t> utf8_length(std::string_view text) {
     return length;
 }
 
-std::optional<AudioFormat> parse_audio_format(const json& request, ApiError& error) {
-    if (not request.contains("response_format")) {
-        return AudioFormat::mp3;
+SpeechRequestResult validate_request(SpeechRequestPayload payload) {
+    if (payload.model != "voxcpm2") {
+        return std::unexpected(invalid("only model 'voxcpm2' is available", "model"));
     }
-    if (not request["response_format"].is_string()) {
-        error = invalid("response_format must be a string", "response_format");
-        return std::nullopt;
+    if (payload.input.empty()) {
+        return std::unexpected(invalid("input must not be empty", "input"));
     }
-    const std::string value = request["response_format"].get<std::string>();
-    if (value == "mp3") {
-        return AudioFormat::mp3;
+    const std::optional<std::size_t> input_length = utf8_length(payload.input);
+    if (not input_length.has_value()) {
+        return std::unexpected(invalid("input must be valid UTF-8", "input"));
     }
-    if (value == "opus") {
-        return AudioFormat::opus;
+    if (*input_length > 4096) {
+        return std::unexpected(invalid("input must not exceed 4096 characters", "input"));
     }
-    if (value == "aac") {
-        return AudioFormat::aac;
+    if (payload.instructions.has_value() and not payload.instructions->empty()) {
+        return std::unexpected(invalid("instructions are not supported by voxcpm2", "instructions"));
     }
-    if (value == "flac") {
-        return AudioFormat::flac;
+    if (payload.speed.has_value() and (not std::isfinite(*payload.speed) or *payload.speed != 1.0)) {
+        return std::unexpected(invalid("only speed 1.0 is supported by voxcpm2", "speed"));
     }
-    if (value == "wav") {
-        return AudioFormat::wav;
+    if (payload.stream_format.has_value() and *payload.stream_format != "audio") {
+        return std::unexpected(invalid("only stream_format 'audio' is supported by voxcpm2", "stream_format"));
     }
-    if (value == "pcm") {
-        return AudioFormat::pcm;
-    }
-    error = invalid("response_format must be one of mp3, opus, aac, flac, wav, or pcm", "response_format");
-    return std::nullopt;
-}
-
-std::optional<ApiError> validate_voice(const json& request) {
-    if (not request.contains("voice")) {
-        return invalid("voice is required", "voice");
-    }
-    const json& voice = request["voice"];
-    if (voice.is_string()) {
-        if (voice.get_ref<const std::string&>().empty()) {
-            return invalid("voice must not be empty", "voice");
-        }
-        return std::nullopt;
-    }
-    if (voice.is_object() and voice.size() == 1 and voice.contains("id") and voice["id"].is_string() and
-        not voice["id"].get_ref<const std::string&>().empty()) {
-        return std::nullopt;
-    }
-    return invalid("voice must be a non-empty string or an object containing a non-empty id", "voice");
+    return SpeechRequest{
+        .input = std::move(payload.input),
+        .response_format = payload.response_format,
+    };
 }
 
 } // namespace
@@ -147,114 +304,36 @@ bool is_json_content_type(std::string_view content_type) {
 
 SpeechRequestResult parse_speech_request(std::string_view body) {
     if (body.size() > max_request_body_bytes) {
-        return invalid("request body exceeds 64 KiB", std::nullopt, 413);
+        return std::unexpected(invalid("request body exceeds 64 KiB", std::nullopt, 413));
     }
     const json request = json::parse(body, nullptr, false);
     if (request.is_discarded()) {
-        return invalid("request body is not valid JSON");
+        return std::unexpected(invalid("request body is not valid JSON"));
     }
     if (not request.is_object()) {
-        return invalid("request body must be a JSON object");
+        return std::unexpected(invalid("request body must be a JSON object"));
     }
 
-    constexpr std::array<std::string_view, 7> allowed_fields{
-        "model",
-        "input",
-        "voice",
-        "instructions",
-        "response_format",
-        "speed",
-        "stream_format",
-    };
-    for (const auto& [key, value] : request.items()) {
-        static_cast<void>(value);
-        if (std::ranges::find(allowed_fields, key) == allowed_fields.end()) {
-            return invalid("unknown field: " + key, key);
-        }
+    try {
+        return validate_request(request.get<SpeechRequestPayload>());
+    } catch (const RequestDecodeError& error) {
+        return std::unexpected(error.error());
     }
-
-    if (not request.contains("model")) {
-        return invalid("model is required", "model");
-    }
-    if (not request["model"].is_string()) {
-        return invalid("model must be a string", "model");
-    }
-    if (request["model"].get_ref<const std::string&>() != "voxcpm2") {
-        return invalid("only model 'voxcpm2' is available", "model");
-    }
-
-    if (not request.contains("input")) {
-        return invalid("input is required", "input");
-    }
-    if (not request["input"].is_string()) {
-        return invalid("input must be a string", "input");
-    }
-    const std::string input = request["input"].get<std::string>();
-    if (input.empty()) {
-        return invalid("input must not be empty", "input");
-    }
-    const std::optional<std::size_t> input_length = utf8_length(input);
-    if (not input_length.has_value()) {
-        return invalid("input must be valid UTF-8", "input");
-    }
-    if (*input_length > 4096) {
-        return invalid("input must not exceed 4096 characters", "input");
-    }
-
-    if (const std::optional<ApiError> voice_error = validate_voice(request); voice_error.has_value()) {
-        return *voice_error;
-    }
-
-    if (request.contains("instructions")) {
-        if (not request["instructions"].is_string()) {
-            return invalid("instructions must be a string", "instructions");
-        }
-        if (not request["instructions"].get_ref<const std::string&>().empty()) {
-            return invalid("instructions are not supported by voxcpm2", "instructions");
-        }
-    }
-
-    if (request.contains("speed")) {
-        if (not request["speed"].is_number()) {
-            return invalid("speed must be a number", "speed");
-        }
-        const double speed = request["speed"].get<double>();
-        if (not std::isfinite(speed) or speed != 1.0) {
-            return invalid("only speed 1.0 is supported by voxcpm2", "speed");
-        }
-    }
-
-    if (request.contains("stream_format")) {
-        if (not request["stream_format"].is_string()) {
-            return invalid("stream_format must be a string", "stream_format");
-        }
-        if (request["stream_format"].get_ref<const std::string&>() != "audio") {
-            return invalid("only stream_format 'audio' is supported by voxcpm2", "stream_format");
-        }
-    }
-
-    ApiError format_error;
-    const std::optional<AudioFormat> response_format = parse_audio_format(request, format_error);
-    if (not response_format.has_value()) {
-        return format_error;
-    }
-    return SpeechRequest{
-        .input = input,
-        .response_format = *response_format,
-    };
 }
 
 std::string serialize_error(const ApiError& error) {
-    const json body = {
-        {"error",
-         {
-             {"message", error.message},
-             {"type", error.type},
-             {"param", error.param.has_value() ? json(*error.param) : json(nullptr)},
-             {"code", nullptr},
-         }},
-    };
-    return body.dump();
+    return json(ApiErrorEnvelope{
+                    .error = ApiErrorBody{
+                        .message = error.message,
+                        .type = error.type,
+                        .param = error.param,
+                    },
+                })
+        .dump();
+}
+
+std::string serialize_health() {
+    return json(HealthResponse{.status = "ok", .model = "voxcpm2"}).dump();
 }
 
 int output_sample_rate(AudioFormat format) {

@@ -9,6 +9,7 @@
 #include "components.h"
 #include "helpers.h"
 #include "kvcache.h"
+#include "model_manifest.h"
 #include "ncnn_layers/registry.h"
 #include "profile.h"
 #include "progress.h"
@@ -21,7 +22,6 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <memory>
 #include <numbers>
 #include <numeric>
@@ -32,12 +32,10 @@
 
 #include <mat.h>
 #include <net.h>
-#include <nlohmann/json.hpp>
 
 namespace voxcpm2 {
 namespace {
 
-using json = nlohmann::json;
 using namespace runtime;
 
 struct PrefixRow {
@@ -254,7 +252,6 @@ public:
         {
             auto timing = load_profile.scope("assets_and_tokenizer");
             load_manifest();
-            tokenizer_ = Tokenizer::from_file(model_dir_ / "tokenizer.json");
         }
         load_profile.report("model_load");
     }
@@ -750,83 +747,46 @@ public:
 private:
     void load_manifest() {
         const std::filesystem::path manifest_path = model_dir_ / "model.json";
-        std::ifstream ifs(manifest_path);
-        if (not ifs) [[unlikely]] {
-            throw std::runtime_error("cannot open " + manifest_path.string());
-        }
-        ifs >> manifest_;
+        const ModelManifest manifest = load_model_manifest(manifest_path);
+        const ModelSettings& setting = manifest.setting;
+        patch_size_ = setting.patch_size;
+        feat_dim_ = setting.feat_dim;
+        latent_dim_ = setting.latent_dim;
+        chunk_size_ = setting.chunk_size;
+        encode_sample_rate_ = setting.encode_sample_rate;
+        out_sample_rate_ = setting.out_sample_rate;
+        base_attn_count_ = setting.base_attn_cnt;
+        residual_attn_count_ = setting.residual_attn_cnt;
+        kv_head_count_ = setting.kv_head_cnt;
 
-        const std::string model_type = manifest_.value("model_type", "");
-        if (model_type != "voxcpm2_tts") [[unlikely]] {
-            throw std::runtime_error("model.json model_type must be voxcpm2_tts");
-        }
-        format_version_ = manifest_.value("format_version", 1);
-        if (format_version_ < 2) [[unlikely]] {
-            throw std::runtime_error("VoxCPM2 ncnn assets must be format_version >= 2; re-export assets");
-        }
-
-        const auto setting = manifest_.value("setting", json::object());
-        patch_size_ = setting.value("patch_size", patch_size_);
-        feat_dim_ = setting.value("feat_dim", feat_dim_);
-        latent_dim_ = setting.value("latent_dim", latent_dim_);
-        chunk_size_ = setting.value("chunk_size", chunk_size_);
-        encode_sample_rate_ = setting.value("encode_sample_rate", encode_sample_rate_);
-        out_sample_rate_ = setting.value("out_sample_rate", out_sample_rate_);
-        base_attn_count_ = setting.value("base_attn_cnt", base_attn_count_);
-        residual_attn_count_ = setting.value("residual_attn_cnt", residual_attn_count_);
-        kv_head_count_ = setting.value("kv_head_cnt", kv_head_count_);
-
-        const auto rope = setting.value("rope", json::object());
-        rope_head_dim_ = rope.value("rope_head_dim", rope_head_dim_);
-        rope_theta_ = rope.value("rope_theta", rope_theta_);
-        rope_original_max_position_embeddings_ =
-            rope.value("original_max_position_embeddings", rope_original_max_position_embeddings_);
-        rope_short_factor_.clear();
-        rope_long_factor_.clear();
-        if (rope.contains("short_factor") and rope["short_factor"].is_array()) {
-            for (const auto& item : rope["short_factor"]) {
-                rope_short_factor_.push_back(item.get<float>());
-            }
-        }
-        if (rope.contains("long_factor") and rope["long_factor"].is_array()) {
-            for (const auto& item : rope["long_factor"]) {
-                rope_long_factor_.push_back(item.get<float>());
-            }
-        }
+        rope_head_dim_ = setting.rope.rope_head_dim;
+        rope_theta_ = setting.rope.rope_theta;
+        rope_original_max_position_embeddings_ = setting.rope.original_max_position_embeddings;
+        rope_short_factor_ = setting.rope.short_factor;
+        rope_long_factor_ = setting.rope.long_factor;
         prepare_rope_inverse_frequency();
 
-        const auto tokens = setting.value("tokens", json::object());
-        audio_start_token_ = tokens.value("audio_start", audio_start_token_);
-        ref_audio_start_token_ = tokens.value("ref_audio_start", ref_audio_start_token_);
-        ref_audio_end_token_ = tokens.value("ref_audio_end", ref_audio_end_token_);
+        audio_start_token_ = setting.tokens.audio_start;
+        ref_audio_start_token_ = setting.tokens.ref_audio_start;
+        ref_audio_end_token_ = setting.tokens.ref_audio_end;
 
-        const auto params = manifest_.value("params", json::object());
         progress::begin_phase(progress::Phase::model_load, "model load", static_cast<int>(kComponentSpecs.size()));
         int loaded = 0;
         for (const ComponentSpec& spec : kComponentSpecs) {
             const std::string param_key = resolve_param_key(spec.id, use_vulkan_);
-            if (params.contains(param_key)) {
+            const auto params = manifest.params.find(param_key);
+            if (params != manifest.params.end()) {
                 progress::current(spec.name, loaded + 1, static_cast<int>(kComponentSpecs.size()));
-                load_net(spec.id, params.at(param_key));
+                load_net(spec.id, params->second);
                 ++loaded;
-            } else if (spec.dual_backend) {
-                throw std::runtime_error("model.json missing params." + param_key);
             }
             progress::advance_phase(spec.name);
         }
         progress::finish_phase("model load");
+        tokenizer_ = Tokenizer::from_file(model_dir_ / manifest.tokenizer.tokenizer_json);
     }
 
-    void load_net(Component component, const json& params) {
-        if (not params.is_object()) {
-            return;
-        }
-        const std::string param_file = params.value("param", "");
-        const std::string bin_file = params.value("bin", "");
-        if (param_file.empty() or bin_file.empty()) {
-            return;
-        }
-
+    void load_net(Component component, const ComponentFiles& files) {
         const ComponentSpec& spec = component_spec(component);
         auto net_ptr = std::make_unique<ncnn::Net>();
         net_ptr->opt = option_for_net(component);
@@ -836,10 +796,10 @@ private:
         }
 #endif
         register_component_layers(*net_ptr, component);
-        if (net_ptr->load_param((model_dir_ / param_file).string().c_str()) != 0) [[unlikely]] {
+        if (net_ptr->load_param((model_dir_ / files.param).string().c_str()) != 0) [[unlikely]] {
             throw std::runtime_error("failed to load param for " + std::string(spec.name));
         }
-        if (net_ptr->load_model((model_dir_ / bin_file).string().c_str()) != 0) [[unlikely]] {
+        if (net_ptr->load_model((model_dir_ / files.bin).string().c_str()) != 0) [[unlikely]] {
             throw std::runtime_error("failed to load bin for " + std::string(spec.name));
         }
         nets_[static_cast<std::size_t>(component)] = std::move(net_ptr);
@@ -976,32 +936,30 @@ private:
     }
 
     std::filesystem::path model_dir_;
-    json manifest_;
     Tokenizer tokenizer_;
     std::array<std::unique_ptr<ncnn::Net>, static_cast<std::size_t>(Component::count)> nets_;
     bool use_vulkan_ = false;
     bool profile_ = false;
     int threads_ = 4;
     int vulkan_device_ = 0;
-    int format_version_ = 2;
 
     int hidden_size_ = 2048;
-    int patch_size_ = 4;
-    int feat_dim_ = 64;
-    int latent_dim_ = 64;
-    int chunk_size_ = 640;
-    int audio_start_token_ = 101;
-    int ref_audio_start_token_ = 103;
-    int ref_audio_end_token_ = 104;
-    int encode_sample_rate_ = 16000;
-    int out_sample_rate_ = 48000;
-    int base_attn_count_ = 28;
-    int residual_attn_count_ = 8;
-    int kv_head_count_ = 2;
-    int rope_head_dim_ = 128;
-    int rope_original_max_position_embeddings_ = 32768;
+    int patch_size_ = 0;
+    int feat_dim_ = 0;
+    int latent_dim_ = 0;
+    int chunk_size_ = 0;
+    int audio_start_token_ = 0;
+    int ref_audio_start_token_ = 0;
+    int ref_audio_end_token_ = 0;
+    int encode_sample_rate_ = 0;
+    int out_sample_rate_ = 0;
+    int base_attn_count_ = 0;
+    int residual_attn_count_ = 0;
+    int kv_head_count_ = 0;
+    int rope_head_dim_ = 0;
+    int rope_original_max_position_embeddings_ = 0;
     int max_generation_patches_ = 2000;
-    float rope_theta_ = 10000.0f;
+    float rope_theta_ = 0.0f;
     std::vector<float> rope_short_factor_;
     std::vector<float> rope_long_factor_;
     std::vector<float> rope_inverse_frequency_;

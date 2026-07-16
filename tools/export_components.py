@@ -817,14 +817,35 @@ def update_manifest(asset_dir: Path, exported: list[str], decoder_len: int) -> N
         }
     manifest["params"] = params
     missing = [name for name in COMPONENTS if name not in allowed]
-    manifest["missing_components"] = missing
     setting = manifest.setdefault("setting", {})
     setting["decoder_context_length"] = decoder_len
     setting.setdefault("kv_head_cnt", 2)
-    manifest["tokenizer"] = {
-        "type": "voxcpm2_tokenizer_json",
-        "tokenizer_json": "tokenizer.json",
-        "split_multichar_cjk": True,
+    setting_fields = (
+        "patch_size",
+        "feat_dim",
+        "latent_dim",
+        "chunk_size",
+        "decode_chunk_size",
+        "encode_sample_rate",
+        "out_sample_rate",
+        "base_attn_cnt",
+        "residual_attn_cnt",
+        "tokens",
+        "rope",
+        "decoder_context_length",
+        "kv_head_cnt",
+    )
+    manifest = {
+        "model_type": "voxcpm2_tts",
+        "format_version": 2,
+        "params": params,
+        "missing_components": missing,
+        "tokenizer": {
+            "type": "voxcpm2_tokenizer_json",
+            "tokenizer_json": "tokenizer.json",
+            "split_multichar_cjk": True,
+        },
+        "setting": {field: setting[field] for field in setting_fields},
     }
     model_json.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 

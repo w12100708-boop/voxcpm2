@@ -9,7 +9,6 @@
 #include <array>
 #include <stdexcept>
 #include <string>
-#include <variant>
 
 namespace {
 
@@ -21,16 +20,14 @@ void require(bool condition, const char* message) {
 
 voxcpm2::server::SpeechRequest require_request(const std::string& body) {
     const voxcpm2::server::SpeechRequestResult result = voxcpm2::server::parse_speech_request(body);
-    const auto* request = std::get_if<voxcpm2::server::SpeechRequest>(&result);
-    require(request != nullptr, "request should be accepted");
-    return *request;
+    require(result.has_value(), "request should be accepted");
+    return result.value();
 }
 
 voxcpm2::server::ApiError require_error(const std::string& body) {
     const voxcpm2::server::SpeechRequestResult result = voxcpm2::server::parse_speech_request(body);
-    const auto* error = std::get_if<voxcpm2::server::ApiError>(&result);
-    require(error != nullptr, "request should be rejected");
-    return *error;
+    require(not result.has_value(), "request should be rejected");
+    return result.error();
 }
 
 std::string request_with(std::string field) {
@@ -110,6 +107,7 @@ int main() {
     const std::string serialized = voxcpm2::server::serialize_error(error);
     require(serialized.find("\"server_error\"") != std::string::npos, "error type should be serialized");
     require(serialized.find("\"param\":null") != std::string::npos, "null error param should be serialized");
+    require(voxcpm2::server::serialize_health() == R"({"model":"voxcpm2","status":"ok"})", "health response mismatch");
     require(voxcpm2::server::output_sample_rate(AudioFormat::pcm) == 24000, "PCM must be 24 kHz");
     require(voxcpm2::server::output_sample_rate(AudioFormat::wav) == 0, "container formats should keep native rate");
     return 0;

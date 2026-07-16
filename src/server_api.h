@@ -9,10 +9,10 @@
 #include "voxcpm2/audio_io.h"
 
 #include <cstddef>
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <variant>
 
 namespace voxcpm2::server {
 
@@ -30,11 +30,12 @@ struct ApiError {
     std::optional<std::string> param;
 };
 
-using SpeechRequestResult = std::variant<SpeechRequest, ApiError>;
+using SpeechRequestResult = std::expected<SpeechRequest, ApiError>;
 
 [[nodiscard]] bool is_json_content_type(std::string_view content_type);
 [[nodiscard]] SpeechRequestResult parse_speech_request(std::string_view body);
 [[nodiscard]] std::string serialize_error(const ApiError& error);
+[[nodiscard]] std::string serialize_health();
 [[nodiscard]] int output_sample_rate(AudioFormat format);
 
 } // namespace voxcpm2::server

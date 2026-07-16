@@ -16,7 +16,6 @@
 #include <print>
 #include <stdexcept>
 #include <string>
-#include <variant>
 #include <vector>
 
 #include <CLI/CLI.hpp>
@@ -110,7 +109,7 @@ int main(int argc, char** argv) {
         crow::SimpleApp server;
         CROW_ROUTE(server, "/healthz")
         ([] {
-            crow::response response(200, R"({"status":"ok","model":"voxcpm2"})");
+            crow::response response(200, voxcpm2::server::serialize_health());
             response.set_header("Content-Type", "application/json");
             return response;
         });
@@ -128,10 +127,10 @@ int main(int argc, char** argv) {
 
                 const voxcpm2::server::SpeechRequestResult parsed =
                     voxcpm2::server::parse_speech_request(request.body);
-                if (const auto* error = std::get_if<voxcpm2::server::ApiError>(&parsed); error != nullptr) {
-                    return error_response(*error);
+                if (not parsed.has_value()) {
+                    return error_response(parsed.error());
                 }
-                const auto& speech = std::get<voxcpm2::server::SpeechRequest>(parsed);
+                const auto& speech = parsed.value();
 
                 try {
                     voxcpm2::SynthesisOptions options;

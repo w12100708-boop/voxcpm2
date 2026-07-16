@@ -60,7 +60,6 @@ def main() -> None:
         "tokenizer": {
             "type": "voxcpm2_tokenizer_json",
             "tokenizer_json": "tokenizer.json",
-            "tokenizer_config": "tokenizer_config.json",
             "split_multichar_cjk": True,
         },
         "setting": {
@@ -73,6 +72,7 @@ def main() -> None:
             "out_sample_rate": 48000,
             "base_attn_cnt": 28,
             "residual_attn_cnt": 8,
+            "decoder_context_length": 4,
             "kv_head_cnt": config["lm_config"].get("num_key_value_heads", 2),
             "tokens": {
                 "audio_start": 101,

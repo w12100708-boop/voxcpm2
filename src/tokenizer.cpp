@@ -12,6 +12,7 @@
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 #include <nlohmann/json.hpp>
 
@@ -19,6 +20,24 @@ namespace voxcpm2 {
 namespace {
 
 using json = nlohmann::json;
+
+struct TokenizerModel {
+    std::unordered_map<std::string, int> vocab;
+    std::vector<std::string> merges;
+};
+
+struct TokenizerDocument {
+    TokenizerModel model;
+};
+
+void from_json(const json& document, TokenizerModel& model) {
+    document.at("vocab").get_to(model.vocab);
+    document.at("merges").get_to(model.merges);
+}
+
+void from_json(const json& document, TokenizerDocument& tokenizer) {
+    document.at("model").get_to(tokenizer.model);
+}
 
 std::string pair_key(const std::string& a, const std::string& b) {
     std::string key;
@@ -209,15 +228,17 @@ Tokenizer Tokenizer::from_file(const std::filesystem::path& path) {
         throw std::runtime_error("cannot open tokenizer: " + path.string());
     }
 
-    json tokenizer;
-    ifs >> tokenizer;
+    TokenizerDocument document;
+    try {
+        json tokenizer_json;
+        ifs >> tokenizer_json;
+        document = tokenizer_json.get<TokenizerDocument>();
+    } catch (const json::exception& error) {
+        throw std::runtime_error(std::format("invalid tokenizer {}: {}", path.string(), error.what()));
+    }
 
     Tokenizer out;
-    const auto model = tokenizer.at("model");
-    const auto vocab = model.at("vocab");
-    for (auto it = vocab.begin(); it != vocab.end(); ++it) {
-        out.token_to_id_[it.key()] = it.value().get<int>();
-    }
+    out.token_to_id_ = std::move(document.model.vocab);
 
     for (const auto& [token, id] : out.token_to_id_) {
         (void)id;
@@ -227,8 +248,7 @@ Tokenizer Tokenizer::from_file(const std::filesystem::path& path) {
     }
 
     int rank = 0;
-    for (const auto& item : model.at("merges")) {
-        const std::string line = item.get<std::string>();
+    for (const std::string& line : document.model.merges) {
         const std::size_t pos = line.find(' ');
         if (pos == std::string::npos) {
             continue;
