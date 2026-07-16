@@ -1,6 +1,6 @@
 # voxcpm2-ncnn
 
-VoxCPM2 text-to-speech runtime for ncnn. This repository contains a C++23
+VoxCPM2 text-to-speech runtime for ncnn. This repository contains a C++26
 runtime library, a small CLI, custom ncnn SDPA support for the DiT graph, and
 the Python exporter used to build the runtime asset directory.
 
@@ -206,51 +206,36 @@ both libraries.
 
 The runtime is available in both static and shared forms. The target names are
 `voxcpm2_ncnn` and `voxcpm2_ncnn_shared`; their outputs are
-`libvoxcpm2_ncnn.a` and `libvoxcpm2_ncnn.so`, respectively.
+`libvoxcpm2_ncnn.a` and `libvoxcpm2_ncnn.so`, respectively. The shared target
+exports the stable C ABI in `include/voxcpm2/c_api.h`. It provides opaque
+synthesizer and operation handles, explicit status/error ownership, PCM and
+string-list free functions, progress callbacks, and cross-thread cancellation.
+The header is valid C11 and does not expose C++ or ncnn types.
 
 ```sh
 xmake build voxcpm2_ncnn_shared
 ```
 
-## Android JNI
+An operation handle belongs to one synchronous call. It may be cancelled from
+another thread, but must remain alive until that call returns. Destroying a
+synthesizer cancels its active operation, prevents queued calls from entering,
+and waits for all callers to leave native code. Buffers, lists, and errors
+returned by the ABI must be released with their matching `voxcpm2_*_free`
+function.
 
-Android arm64 builds expose the synthesis runtime through
-`libvoxcpm2_jni.so`, which links against `libvoxcpm2_ncnn.so`. The JNI owner is
-`top.yurin.voxcpm2.VoxCPM2`. This repository intentionally provides only the
-native binding; the consuming Android project declares the matching methods:
+## JNI
 
-```java
-package top.yurin.voxcpm2;
+Android arm64 and Linux x64 builds expose the C ABI through
+`libvoxcpm2_jni.so`, which links against `libvoxcpm2_ncnn.so`. JNI methods are
+registered from `JNI_OnLoad` on the internal Kotlin class
+`top.yurin.voxcpm2.internal.JniBindings`; there are no name-mangled Java-export
+symbols. The adapter includes native operation creation/cancellation, progress
+callbacks, and status-to-Kotlin exception mapping. It is consumed by
+[`voxcpm2k`](https://github.com/LiYulin-s/voxcpm2k), not intended as a separate
+Java API.
 
-public final class VoxCPM2 {
-    static {
-        System.loadLibrary("voxcpm2_jni");
-    }
-
-    private static native long nativeCreate(
-        String modelDir, boolean useVulkan, boolean profile,
-        int threads, int vulkanDevice);
-    private static native void nativeDestroy(long handle);
-    private static native float[] nativeGenerate(
-        long handle, String text, String promptText,
-        float[] promptAudio, float[] referenceAudio,
-        int minPatches, int inferenceTimesteps, float cfgValue);
-    private static native void nativeSmokeComponents(long handle);
-    private static native int nativeGetInputSampleRate(long handle);
-    private static native int nativeGetOutputSampleRate(long handle);
-    private static native String[] nativeGetMissingRequiredComponents(long handle);
-}
-```
-
-`promptAudio` and `referenceAudio` are nullable mono float PCM arrays at
-`nativeGetInputSampleRate(handle)`. The returned array is mono float PCM at
-`nativeGetOutputSampleRate(handle)`. Calls on one handle are serialized;
-`nativeDestroy` waits for an active call and `nativeDestroy(0)` is a no-op.
-Invalid arguments raise `IllegalArgumentException`, closed handles raise
-`IllegalStateException`, and native runtime failures raise `RuntimeException`.
-
-The Android build requires API 26 or newer and an NDK with Clang 19 or newer
-(NDK r28+), because the runtime uses C++23 and `#embed`. Use `c++_shared` when
+The Android build requires API 26 or newer and NDK r28 or newer, because the
+runtime preserves shader `#embed` and compiles as C++26. Use `c++_shared` when
 building the two shared libraries:
 
 ```sh
@@ -261,37 +246,33 @@ xmake build voxcpm2_ncnn_shared
 xmake build voxcpm2_jni
 ```
 
-An external Android library/app can point xmake-gradle at this repository
-without adding a Gradle project here:
+Linux desktop JNI additionally needs a JDK include directory:
 
-```groovy
-plugins {
-    id 'org.tboox.gradle-xmake-plugin' version '1.2.3'
-}
-
-android {
-    defaultConfig {
-        minSdkVersion 26
-        ndk { abiFilters 'arm64-v8a' }
-        externalNativeBuild {
-            xmake { targets 'voxcpm2_ncnn_shared', 'voxcpm2_jni' }
-        }
-    }
-    externalNativeBuild {
-        xmake {
-            path '/absolute/path/to/voxcpm-ncnn/xmake.lua'
-            sdkver 26
-            stl 'c++_shared'
-        }
-    }
-}
+```sh
+xmake f -p linux -a x86_64 -m release --jdk="$JAVA_HOME"
+xmake build voxcpm2_jni
 ```
 
 The model package is not bundled into the native libraries. Download or copy
 it to a real app-accessible filesystem directory and pass that directory to
-`nativeCreate`; an APK asset path cannot be opened through the runtime's
-`std::filesystem` interface. The Android core and JNI targets intentionally do
-not include the optional FFmpeg audio adapter.
+the Kotlin binding; an APK asset path cannot be opened through the runtime's
+`std::filesystem` interface. The core and JNI targets intentionally do not
+include the optional FFmpeg audio adapter.
+
+## iOS shared runtime
+
+The shared C ABI can be built for iPhone and arm64 simulator targets. ncnn's
+xmake package supplies MoltenVK when Vulkan is enabled; the resulting dylibs
+are packaged as a shared XCFramework by `voxcpm2k` and embedded into the final
+app bundle.
+
+```sh
+xmake f -p iphoneos -a arm64 -m release --appledev=iphone
+xmake build voxcpm2_ncnn_shared
+
+xmake f -p iphoneos -a arm64 -m release --appledev=simulator
+xmake build voxcpm2_ncnn_shared
+```
 
 ## License
 

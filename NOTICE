@@ -18,3 +18,8 @@ src/ncnn_layers are derived from BSD-3-Clause licensed ncnn SDPA Vulkan layer
 and shader code, with local changes for VoxCPM2 graph names, shader embedding,
 and runtime integration. The BSD-3-Clause text is retained in
 LICENSES/BSD-3-Clause.txt for that material.
+
+Distributed native binaries also contain or accompany ncnn (BSD-3-Clause),
+LLVM OpenMP on Linux (Apache-2.0 with LLVM Exceptions), and MoltenVK on Apple
+platforms (Apache-2.0). Their applicable texts are retained under `LICENSES`;
+see `CREDITS.md` for the platform mapping.

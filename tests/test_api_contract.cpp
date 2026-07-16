@@ -6,6 +6,7 @@
 
 #include "voxcpm2/audio.h"
 #include "voxcpm2/audio_io.h"
+#include "voxcpm2/c_api.h"
 #include "voxcpm2/synthesizer.h"
 #include "voxcpm2/tokenizer.h"
 
@@ -20,6 +21,7 @@
 static_assert(std::is_same_v<decltype(voxcpm2::AudioBuffer::sample_rate), int>);
 static_assert(std::is_same_v<decltype(voxcpm2::AudioBuffer::channels), int>);
 static_assert(std::is_same_v<decltype(voxcpm2::AudioBuffer::samples), std::vector<float>>);
+static_assert(VOXCPM2_C_ABI_VERSION_MAJOR == 1u);
 
 static_assert(std::is_same_v<
               decltype(std::declval<const voxcpm2::Tokenizer&>().encode(std::declval<const std::string&>())),

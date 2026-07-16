@@ -1,38 +1,29 @@
-// Android JNI bindings for the VoxCPM2 synthesis runtime
+// JNI adapter for the stable VoxCPM2 C ABI
 
 // Copyright (c) 2026 Yurin <liyulin.china@gmail.com>
 // Licensed under MIT. Not all rights reserved.
 // SPDX-License-Identifier: MIT
 
-#include "voxcpm2/synthesizer.h"
+#include "voxcpm2/c_api.h"
 
 #include <jni.h>
 
-#include <cmath>
 #include <cstdint>
 #include <limits>
-#include <memory>
-#include <mutex>
 #include <new>
-#include <optional>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
+#include <string_view>
 #include <utility>
-#include <vector>
 
 namespace {
 
 class PendingJavaException final {};
 
-class InvalidHandle final : public std::runtime_error {
-public:
-    InvalidHandle() : std::runtime_error("invalid or closed VoxCPM2 native handle") {}
-};
-
 class StringChars final {
 public:
-    StringChars(JNIEnv* env, jstring value) : env_(env), value_(value), chars_(env->GetStringChars(value, nullptr)) {
+    StringChars(JNIEnv* env, jstring value)
+        : env_(env), value_(value), chars_(env->GetStringChars(value, nullptr)) {
         if (chars_ == nullptr) {
             throw PendingJavaException{};
         }
@@ -55,7 +46,51 @@ private:
     const jchar* chars_;
 };
 
+class FloatArrayView final {
+public:
+    FloatArrayView(JNIEnv* env, jfloatArray value) : env_(env), value_(value) {
+        if (value_ == nullptr) {
+            return;
+        }
+        length_ = env_->GetArrayLength(value_);
+        values_ = env_->GetFloatArrayElements(value_, nullptr);
+        if (values_ == nullptr) {
+            throw PendingJavaException{};
+        }
+    }
+
+    ~FloatArrayView() {
+        if (values_ != nullptr) {
+            env_->ReleaseFloatArrayElements(value_, values_, JNI_ABORT);
+        }
+    }
+
+    FloatArrayView(const FloatArrayView&) = delete;
+    FloatArrayView& operator=(const FloatArrayView&) = delete;
+
+    [[nodiscard]] bool present() const {
+        return value_ != nullptr;
+    }
+
+    [[nodiscard]] const float* data() const {
+        return values_;
+    }
+
+    [[nodiscard]] std::size_t size() const {
+        return static_cast<std::size_t>(length_);
+    }
+
+private:
+    JNIEnv* env_;
+    jfloatArray value_ = nullptr;
+    jfloat* values_ = nullptr;
+    jsize length_ = 0;
+};
+
 void append_utf8(std::string& output, std::uint32_t codepoint) {
+    if (codepoint == 0) {
+        throw std::invalid_argument("strings passed to VoxCPM2 must not contain NUL");
+    }
     if (codepoint <= 0x7f) {
         output.push_back(static_cast<char>(codepoint));
     } else if (codepoint <= 0x7ff) {
@@ -104,84 +139,7 @@ std::string java_string(JNIEnv* env, jstring value, const char* field, bool null
     return output;
 }
 
-std::optional<voxcpm2::AudioBuffer> java_audio(
-    JNIEnv* env,
-    jfloatArray value,
-    int sample_rate,
-    const char* field) {
-    if (value == nullptr) {
-        return std::nullopt;
-    }
-
-    const jsize length = env->GetArrayLength(value);
-    if (length <= 0) {
-        throw std::invalid_argument(std::string(field) + " must not be empty");
-    }
-
-    voxcpm2::AudioBuffer audio;
-    audio.sample_rate = sample_rate;
-    audio.channels = 1;
-    audio.samples.resize(static_cast<std::size_t>(length));
-    env->GetFloatArrayRegion(value, 0, length, audio.samples.data());
-    if (env->ExceptionCheck()) {
-        throw PendingJavaException{};
-    }
-    return audio;
-}
-
-jfloatArray java_audio(JNIEnv* env, const voxcpm2::AudioBuffer& audio) {
-    if (audio.channels != 1) {
-        throw std::runtime_error("VoxCPM2 JNI output must be mono");
-    }
-    if (audio.samples.size() > static_cast<std::size_t>(std::numeric_limits<jsize>::max())) {
-        throw std::length_error("VoxCPM2 output is too large for a Java float array");
-    }
-
-    const jsize length = static_cast<jsize>(audio.samples.size());
-    jfloatArray output = env->NewFloatArray(length);
-    if (output == nullptr) {
-        throw PendingJavaException{};
-    }
-    if (length > 0) {
-        env->SetFloatArrayRegion(output, 0, length, audio.samples.data());
-        if (env->ExceptionCheck()) {
-            env->DeleteLocalRef(output);
-            throw PendingJavaException{};
-        }
-    }
-    return output;
-}
-
-jobjectArray java_strings(JNIEnv* env, const std::vector<std::string>& values) {
-    if (values.size() > static_cast<std::size_t>(std::numeric_limits<jsize>::max())) {
-        throw std::length_error("too many strings for a Java array");
-    }
-    jclass string_class = env->FindClass("java/lang/String");
-    if (string_class == nullptr) {
-        throw PendingJavaException{};
-    }
-    jobjectArray output = env->NewObjectArray(static_cast<jsize>(values.size()), string_class, nullptr);
-    env->DeleteLocalRef(string_class);
-    if (output == nullptr) {
-        throw PendingJavaException{};
-    }
-    for (std::size_t index = 0; index < values.size(); ++index) {
-        jstring value = env->NewStringUTF(values[index].c_str());
-        if (value == nullptr) {
-            env->DeleteLocalRef(output);
-            throw PendingJavaException{};
-        }
-        env->SetObjectArrayElement(output, static_cast<jsize>(index), value);
-        env->DeleteLocalRef(value);
-        if (env->ExceptionCheck()) {
-            env->DeleteLocalRef(output);
-            throw PendingJavaException{};
-        }
-    }
-    return output;
-}
-
-void throw_java(JNIEnv* env, const char* class_name, const char* message) noexcept {
+void throw_java(JNIEnv* env, const char* class_name, std::string_view message) noexcept {
     if (env->ExceptionCheck()) {
         return;
     }
@@ -189,8 +147,38 @@ void throw_java(JNIEnv* env, const char* class_name, const char* message) noexce
     if (exception_class == nullptr) {
         return;
     }
-    env->ThrowNew(exception_class, message);
+    const std::string stable_message(message);
+    env->ThrowNew(exception_class, stable_message.c_str());
     env->DeleteLocalRef(exception_class);
+}
+
+bool accept_status(JNIEnv* env, voxcpm2_status status, voxcpm2_error& error) noexcept {
+    if (status == VOXCPM2_STATUS_OK) {
+        voxcpm2_error_free(&error);
+        return true;
+    }
+    const std::string_view message = error.message == nullptr ? "VoxCPM2 native operation failed" : error.message;
+    switch (status) {
+    case VOXCPM2_STATUS_INVALID_ARGUMENT:
+        throw_java(env, "java/lang/IllegalArgumentException", message);
+        break;
+    case VOXCPM2_STATUS_INVALID_STATE:
+        throw_java(env, "java/lang/IllegalStateException", message);
+        break;
+    case VOXCPM2_STATUS_CANCELLED:
+        throw_java(env, "java/util/concurrent/CancellationException", message);
+        break;
+    case VOXCPM2_STATUS_OUT_OF_MEMORY:
+        throw_java(env, "java/lang/OutOfMemoryError", message);
+        break;
+    case VOXCPM2_STATUS_RUNTIME_ERROR:
+        throw_java(env, "top/yurin/voxcpm2/VoxCPM2Exception", message);
+        break;
+    case VOXCPM2_STATUS_OK:
+        break;
+    }
+    voxcpm2_error_free(&error);
+    return false;
 }
 
 template <typename Result, typename Callable>
@@ -199,16 +187,14 @@ Result jni_guard(JNIEnv* env, Result fallback, Callable&& callable) noexcept {
         return std::forward<Callable>(callable)();
     } catch (const PendingJavaException&) {
         return fallback;
-    } catch (const InvalidHandle& error) {
-        throw_java(env, "java/lang/IllegalStateException", error.what());
     } catch (const std::invalid_argument& error) {
         throw_java(env, "java/lang/IllegalArgumentException", error.what());
     } catch (const std::bad_alloc&) {
         throw_java(env, "java/lang/OutOfMemoryError", "native allocation failed");
     } catch (const std::exception& error) {
-        throw_java(env, "java/lang/RuntimeException", error.what());
+        throw_java(env, "top/yurin/voxcpm2/VoxCPM2Exception", error.what());
     } catch (...) {
-        throw_java(env, "java/lang/RuntimeException", "unknown native exception");
+        throw_java(env, "top/yurin/voxcpm2/VoxCPM2Exception", "unknown JNI adapter exception");
     }
     return fallback;
 }
@@ -221,221 +207,339 @@ void jni_guard(JNIEnv* env, Callable&& callable) noexcept {
     }));
 }
 
-struct NativeSynthesizer {
-    explicit NativeSynthesizer(voxcpm2::SynthesizerConfig config) : synthesizer(std::move(config)) {}
+template <typename Type>
+Type* native_pointer(jlong value) {
+    return reinterpret_cast<Type*>(static_cast<std::uintptr_t>(value));
+}
 
-    std::mutex mutex;
-    bool closing = false;
-    voxcpm2::Synthesizer synthesizer;
+template <typename Type>
+jlong native_handle(Type* value) {
+    return static_cast<jlong>(reinterpret_cast<std::uintptr_t>(value));
+}
+
+struct JniProgressContext {
+    JNIEnv* env = nullptr;
+    jobject callback = nullptr;
+    jmethodID method = nullptr;
 };
 
-std::mutex registry_mutex;
-std::unordered_map<jlong, std::shared_ptr<NativeSynthesizer>> registry;
-jlong next_handle = 1;
-
-jlong add_synthesizer(std::shared_ptr<NativeSynthesizer> synthesizer) {
-    std::scoped_lock lock(registry_mutex);
-    const jlong first_candidate = next_handle;
-    do {
-        const jlong candidate = next_handle;
-        next_handle = next_handle == std::numeric_limits<jlong>::max() ? 1 : next_handle + 1;
-        if (not registry.contains(candidate)) {
-            registry.emplace(candidate, std::move(synthesizer));
-            return candidate;
-        }
-    } while (next_handle != first_candidate);
-    throw std::runtime_error("VoxCPM2 native handle space exhausted");
+JniProgressContext progress_context(JNIEnv* env, jobject callback) {
+    JniProgressContext context{.env = env, .callback = callback, .method = nullptr};
+    if (callback == nullptr) {
+        return context;
+    }
+    jclass callback_class = env->GetObjectClass(callback);
+    if (callback_class == nullptr) {
+        throw PendingJavaException{};
+    }
+    context.method = env->GetMethodID(callback_class, "onProgress", "(ILjava/lang/String;II)Z");
+    env->DeleteLocalRef(callback_class);
+    if (context.method == nullptr) {
+        throw PendingJavaException{};
+    }
+    return context;
 }
 
-std::shared_ptr<NativeSynthesizer> get_synthesizer(jlong handle) {
-    if (handle <= 0) {
-        throw InvalidHandle{};
+int32_t report_progress(
+    void* user_data,
+    voxcpm2_progress_phase phase,
+    const char* label,
+    int32_t completed,
+    int32_t total) noexcept {
+    auto* context = static_cast<JniProgressContext*>(user_data);
+    if (context == nullptr or context->callback == nullptr) {
+        return 1;
     }
-    std::scoped_lock lock(registry_mutex);
-    const auto found = registry.find(handle);
-    if (found == registry.end()) {
-        throw InvalidHandle{};
+    jstring java_label = context->env->NewStringUTF(label == nullptr ? "" : label);
+    if (java_label == nullptr) {
+        return 0;
     }
-    return found->second;
+    const jboolean keep_going = context->env->CallBooleanMethod(
+        context->callback,
+        context->method,
+        static_cast<jint>(phase),
+        java_label,
+        static_cast<jint>(completed),
+        static_cast<jint>(total));
+    context->env->DeleteLocalRef(java_label);
+    return context->env->ExceptionCheck() or keep_going != JNI_TRUE ? 0 : 1;
 }
 
-void remove_synthesizer(jlong handle) {
-    if (handle == 0) {
-        return;
-    }
-    std::shared_ptr<NativeSynthesizer> synthesizer;
-    {
-        std::scoped_lock lock(registry_mutex);
-        const auto found = registry.find(handle);
-        if (found == registry.end()) {
-            throw InvalidHandle{};
-        }
-        synthesizer = std::move(found->second);
-        registry.erase(found);
-    }
-    std::scoped_lock lock(synthesizer->mutex);
-    synthesizer->closing = true;
+voxcpm2_progress_callback progress_callback(const JniProgressContext& context) {
+    return context.callback == nullptr ? nullptr : report_progress;
 }
 
-template <typename Callable>
-decltype(auto) with_synthesizer(jlong handle, Callable&& callable) {
-    const std::shared_ptr<NativeSynthesizer> synthesizer = get_synthesizer(handle);
-    std::scoped_lock lock(synthesizer->mutex);
-    if (synthesizer->closing) {
-        throw InvalidHandle{};
+jint native_abi_version(JNIEnv*, jclass) {
+    return static_cast<jint>(voxcpm2_c_abi_version());
+}
+
+jlong native_create_operation(JNIEnv* env, jclass) {
+    voxcpm2_operation* operation = voxcpm2_operation_create();
+    if (operation == nullptr) {
+        throw_java(env, "java/lang/OutOfMemoryError", "native allocation failed");
+        return 0;
     }
-    return std::forward<Callable>(callable)(synthesizer->synthesizer);
+    return native_handle(operation);
 }
 
-void clear_synthesizers() {
-    std::vector<std::shared_ptr<NativeSynthesizer>> synthesizers;
-    {
-        std::scoped_lock lock(registry_mutex);
-        synthesizers.reserve(registry.size());
-        for (auto& [handle, synthesizer] : registry) {
-            static_cast<void>(handle);
-            synthesizers.push_back(std::move(synthesizer));
-        }
-        registry.clear();
-    }
-    for (const std::shared_ptr<NativeSynthesizer>& synthesizer : synthesizers) {
-        std::scoped_lock lock(synthesizer->mutex);
-        synthesizer->closing = true;
-    }
+void native_cancel_operation(JNIEnv*, jclass, jlong operation) {
+    voxcpm2_operation_cancel(native_pointer<voxcpm2_operation>(operation));
 }
 
-} // namespace
-
-extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
-    static_cast<void>(vm);
-    return JNI_VERSION_1_6;
+void native_destroy_operation(JNIEnv*, jclass, jlong operation) {
+    voxcpm2_operation_destroy(native_pointer<voxcpm2_operation>(operation));
 }
 
-extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM*, void*) {
-    clear_synthesizers();
-}
-
-extern "C" JNIEXPORT jlong JNICALL Java_top_yurin_voxcpm2_VoxCPM2_nativeCreate(
+jlong native_create(
     JNIEnv* env,
     jclass,
     jstring model_dir,
     jboolean use_vulkan,
     jboolean profile,
     jint threads,
-    jint vulkan_device) {
+    jint vulkan_device,
+    jlong operation,
+    jobject callback) {
     return jni_guard(env, jlong{0}, [&]() {
-        std::string model_path = java_string(env, model_dir, "modelDir");
-        if (model_path.empty()) {
-            throw std::invalid_argument("modelDir must not be empty");
+        const std::string model_path = java_string(env, model_dir, "modelDirectory");
+        JniProgressContext context = progress_context(env, callback);
+        voxcpm2_synthesizer* synthesizer = nullptr;
+        voxcpm2_error error{};
+        const voxcpm2_config config{
+            .model_dir_utf8 = model_path.c_str(),
+            .use_vulkan = use_vulkan == JNI_TRUE ? 1 : 0,
+            .profile = profile == JNI_TRUE ? 1 : 0,
+            .threads = static_cast<int32_t>(threads),
+            .vulkan_device = static_cast<int32_t>(vulkan_device),
+        };
+        const voxcpm2_status status = voxcpm2_synthesizer_create(
+            &config,
+            native_pointer<voxcpm2_operation>(operation),
+            progress_callback(context),
+            &context,
+            &synthesizer,
+            &error);
+        if (env->ExceptionCheck()) {
+            voxcpm2_error_free(&error);
+            voxcpm2_synthesizer_destroy(synthesizer);
+            return jlong{0};
         }
-        auto synthesizer = std::make_shared<NativeSynthesizer>(voxcpm2::SynthesizerConfig{
-            .model_dir = std::move(model_path),
-            .use_vulkan = use_vulkan == JNI_TRUE,
-            .profile = profile == JNI_TRUE,
-            .threads = static_cast<int>(threads),
-            .vulkan_device = static_cast<int>(vulkan_device),
-        });
-        return add_synthesizer(std::move(synthesizer));
+        if (not accept_status(env, status, error)) {
+            return jlong{0};
+        }
+        return native_handle(synthesizer);
     });
 }
 
-extern "C" JNIEXPORT void JNICALL Java_top_yurin_voxcpm2_VoxCPM2_nativeDestroy(
-    JNIEnv* env,
-    jclass,
-    jlong handle) {
-    jni_guard(env, [&]() { remove_synthesizer(handle); });
+void native_destroy(JNIEnv*, jclass, jlong synthesizer) {
+    voxcpm2_synthesizer_destroy(native_pointer<voxcpm2_synthesizer>(synthesizer));
 }
 
-extern "C" JNIEXPORT jfloatArray JNICALL Java_top_yurin_voxcpm2_VoxCPM2_nativeGenerate(
+jint input_sample_rate(JNIEnv* env, voxcpm2_synthesizer* synthesizer) {
+    int32_t sample_rate = 0;
+    voxcpm2_error error{};
+    const voxcpm2_status status = voxcpm2_synthesizer_input_sample_rate(synthesizer, &sample_rate, &error);
+    return accept_status(env, status, error) ? static_cast<jint>(sample_rate) : 0;
+}
+
+jfloatArray native_generate(
     JNIEnv* env,
     jclass,
-    jlong handle,
+    jlong synthesizer_handle,
     jstring text,
     jstring prompt_text,
     jfloatArray prompt_audio,
     jfloatArray reference_audio,
     jint min_patches,
     jint inference_timesteps,
-    jfloat cfg_value) {
+    jfloat cfg_value,
+    jlong operation,
+    jobject callback) {
     return jni_guard(env, static_cast<jfloatArray>(nullptr), [&]() {
-        return with_synthesizer(handle, [&](const voxcpm2::Synthesizer& synthesizer) {
-            voxcpm2::SynthesisOptions options;
-            options.text = java_string(env, text, "text");
-            options.prompt_text = java_string(env, prompt_text, "promptText", true);
-            options.prompt_audio = java_audio(
-                env,
-                prompt_audio,
-                synthesizer.input_sample_rate(),
-                "promptAudio");
-            options.reference_audio = java_audio(
-                env,
-                reference_audio,
-                synthesizer.input_sample_rate(),
-                "referenceAudio");
-            options.min_patches = static_cast<int>(min_patches);
-            options.inference_timesteps = static_cast<int>(inference_timesteps);
-            options.cfg_value = static_cast<float>(cfg_value);
-            if (options.text.empty()) {
-                throw std::invalid_argument("text must not be empty");
-            }
-            if (not options.prompt_text.empty() and not options.prompt_audio.has_value()) {
-                throw std::invalid_argument("promptText requires promptAudio");
-            }
-            if (options.inference_timesteps <= 0) {
-                throw std::invalid_argument("inferenceTimesteps must be positive");
-            }
-            if (not std::isfinite(options.cfg_value)) {
-                throw std::invalid_argument("cfgValue must be finite");
-            }
-            return java_audio(env, synthesizer.generate(options));
-        });
+        auto* synthesizer = native_pointer<voxcpm2_synthesizer>(synthesizer_handle);
+        const std::string cpp_text = java_string(env, text, "text");
+        const std::string cpp_prompt_text = java_string(env, prompt_text, "promptText", true);
+        const jint sample_rate = input_sample_rate(env, synthesizer);
+        if (env->ExceptionCheck()) {
+            return static_cast<jfloatArray>(nullptr);
+        }
+        FloatArrayView prompt_view(env, prompt_audio);
+        FloatArrayView reference_view(env, reference_audio);
+        const voxcpm2_audio_view c_prompt{
+            .samples = prompt_view.data(),
+            .sample_count = prompt_view.size(),
+            .sample_rate = sample_rate,
+            .channels = 1,
+        };
+        const voxcpm2_audio_view c_reference{
+            .samples = reference_view.data(),
+            .sample_count = reference_view.size(),
+            .sample_rate = sample_rate,
+            .channels = 1,
+        };
+        const voxcpm2_synthesis_options options{
+            .text_utf8 = cpp_text.c_str(),
+            .prompt_text_utf8 = prompt_text == nullptr ? nullptr : cpp_prompt_text.c_str(),
+            .prompt_audio = prompt_view.present() ? &c_prompt : nullptr,
+            .reference_audio = reference_view.present() ? &c_reference : nullptr,
+            .min_patches = static_cast<int32_t>(min_patches),
+            .inference_timesteps = static_cast<int32_t>(inference_timesteps),
+            .cfg_value = static_cast<float>(cfg_value),
+        };
+        JniProgressContext context = progress_context(env, callback);
+        voxcpm2_audio_buffer audio{};
+        voxcpm2_error error{};
+        const voxcpm2_status status = voxcpm2_synthesizer_generate(
+            synthesizer,
+            &options,
+            native_pointer<voxcpm2_operation>(operation),
+            progress_callback(context),
+            &context,
+            &audio,
+            &error);
+        if (env->ExceptionCheck()) {
+            voxcpm2_error_free(&error);
+            voxcpm2_audio_buffer_free(&audio);
+            return static_cast<jfloatArray>(nullptr);
+        }
+        if (not accept_status(env, status, error)) {
+            voxcpm2_audio_buffer_free(&audio);
+            return static_cast<jfloatArray>(nullptr);
+        }
+        if (audio.sample_count > static_cast<std::size_t>(std::numeric_limits<jsize>::max())) {
+            voxcpm2_audio_buffer_free(&audio);
+            throw std::length_error("generated audio is too large for a Java float array");
+        }
+        const jsize length = static_cast<jsize>(audio.sample_count);
+        jfloatArray result = env->NewFloatArray(length);
+        if (result == nullptr) {
+            voxcpm2_audio_buffer_free(&audio);
+            throw PendingJavaException{};
+        }
+        if (length > 0) {
+            env->SetFloatArrayRegion(result, 0, length, audio.samples);
+        }
+        voxcpm2_audio_buffer_free(&audio);
+        if (env->ExceptionCheck()) {
+            env->DeleteLocalRef(result);
+            throw PendingJavaException{};
+        }
+        return result;
     });
 }
 
-extern "C" JNIEXPORT void JNICALL Java_top_yurin_voxcpm2_VoxCPM2_nativeSmokeComponents(
+void native_smoke_components(
     JNIEnv* env,
     jclass,
-    jlong handle) {
+    jlong synthesizer,
+    jlong operation,
+    jobject callback) {
     jni_guard(env, [&]() {
-        with_synthesizer(handle, [](const voxcpm2::Synthesizer& synthesizer) {
-            synthesizer.smoke_components();
-        });
+        JniProgressContext context = progress_context(env, callback);
+        voxcpm2_error error{};
+        const voxcpm2_status status = voxcpm2_synthesizer_smoke_components(
+            native_pointer<voxcpm2_synthesizer>(synthesizer),
+            native_pointer<voxcpm2_operation>(operation),
+            progress_callback(context),
+            &context,
+            &error);
+        if (env->ExceptionCheck()) {
+            voxcpm2_error_free(&error);
+            return;
+        }
+        static_cast<void>(accept_status(env, status, error));
     });
 }
 
-extern "C" JNIEXPORT jint JNICALL Java_top_yurin_voxcpm2_VoxCPM2_nativeGetInputSampleRate(
-    JNIEnv* env,
-    jclass,
-    jlong handle) {
-    return jni_guard(env, jint{0}, [&]() {
-        return static_cast<jint>(with_synthesizer(
-            handle,
-            [](const voxcpm2::Synthesizer& synthesizer) { return synthesizer.input_sample_rate(); }));
-    });
+jint native_get_input_sample_rate(JNIEnv* env, jclass, jlong synthesizer) {
+    return input_sample_rate(env, native_pointer<voxcpm2_synthesizer>(synthesizer));
 }
 
-extern "C" JNIEXPORT jint JNICALL Java_top_yurin_voxcpm2_VoxCPM2_nativeGetOutputSampleRate(
-    JNIEnv* env,
-    jclass,
-    jlong handle) {
-    return jni_guard(env, jint{0}, [&]() {
-        return static_cast<jint>(with_synthesizer(
-            handle,
-            [](const voxcpm2::Synthesizer& synthesizer) { return synthesizer.output_sample_rate(); }));
-    });
+jint native_get_output_sample_rate(JNIEnv* env, jclass, jlong synthesizer) {
+    int32_t sample_rate = 0;
+    voxcpm2_error error{};
+    const voxcpm2_status status = voxcpm2_synthesizer_output_sample_rate(
+        native_pointer<voxcpm2_synthesizer>(synthesizer),
+        &sample_rate,
+        &error);
+    return accept_status(env, status, error) ? static_cast<jint>(sample_rate) : 0;
 }
 
-extern "C" JNIEXPORT jobjectArray JNICALL Java_top_yurin_voxcpm2_VoxCPM2_nativeGetMissingRequiredComponents(
-    JNIEnv* env,
-    jclass,
-    jlong handle) {
+jobjectArray native_get_missing_required_components(JNIEnv* env, jclass, jlong synthesizer) {
     return jni_guard(env, static_cast<jobjectArray>(nullptr), [&]() {
-        return java_strings(
-            env,
-            with_synthesizer(
-                handle,
-                [](const voxcpm2::Synthesizer& synthesizer) {
-                    return synthesizer.missing_required_components();
-                }));
+        voxcpm2_string_list components{};
+        voxcpm2_error error{};
+        const voxcpm2_status status = voxcpm2_synthesizer_missing_required_components(
+            native_pointer<voxcpm2_synthesizer>(synthesizer),
+            &components,
+            &error);
+        if (not accept_status(env, status, error)) {
+            return static_cast<jobjectArray>(nullptr);
+        }
+        if (components.count > static_cast<std::size_t>(std::numeric_limits<jsize>::max())) {
+            voxcpm2_string_list_free(&components);
+            throw std::length_error("too many missing component names for a Java array");
+        }
+        jclass string_class = env->FindClass("java/lang/String");
+        if (string_class == nullptr) {
+            voxcpm2_string_list_free(&components);
+            throw PendingJavaException{};
+        }
+        jobjectArray result = env->NewObjectArray(static_cast<jsize>(components.count), string_class, nullptr);
+        env->DeleteLocalRef(string_class);
+        if (result == nullptr) {
+            voxcpm2_string_list_free(&components);
+            throw PendingJavaException{};
+        }
+        for (std::size_t index = 0; index < components.count; ++index) {
+            jstring item = env->NewStringUTF(components.items[index]);
+            if (item == nullptr) {
+                env->DeleteLocalRef(result);
+                voxcpm2_string_list_free(&components);
+                throw PendingJavaException{};
+            }
+            env->SetObjectArrayElement(result, static_cast<jsize>(index), item);
+            env->DeleteLocalRef(item);
+            if (env->ExceptionCheck()) {
+                env->DeleteLocalRef(result);
+                voxcpm2_string_list_free(&components);
+                throw PendingJavaException{};
+            }
+        }
+        voxcpm2_string_list_free(&components);
+        return result;
     });
+}
+
+const JNINativeMethod kMethods[] = {
+    {const_cast<char*>("nativeAbiVersion"), const_cast<char*>("()I"), reinterpret_cast<void*>(native_abi_version)},
+    {const_cast<char*>("nativeCreateOperation"), const_cast<char*>("()J"), reinterpret_cast<void*>(native_create_operation)},
+    {const_cast<char*>("nativeCancelOperation"), const_cast<char*>("(J)V"), reinterpret_cast<void*>(native_cancel_operation)},
+    {const_cast<char*>("nativeDestroyOperation"), const_cast<char*>("(J)V"), reinterpret_cast<void*>(native_destroy_operation)},
+    {const_cast<char*>("nativeCreate"), const_cast<char*>("(Ljava/lang/String;ZZIIJLtop/yurin/voxcpm2/internal/JniProgressCallback;)J"), reinterpret_cast<void*>(native_create)},
+    {const_cast<char*>("nativeDestroy"), const_cast<char*>("(J)V"), reinterpret_cast<void*>(native_destroy)},
+    {const_cast<char*>("nativeGenerate"), const_cast<char*>("(JLjava/lang/String;Ljava/lang/String;[F[FIIFJLtop/yurin/voxcpm2/internal/JniProgressCallback;)[F"), reinterpret_cast<void*>(native_generate)},
+    {const_cast<char*>("nativeSmokeComponents"), const_cast<char*>("(JJLtop/yurin/voxcpm2/internal/JniProgressCallback;)V"), reinterpret_cast<void*>(native_smoke_components)},
+    {const_cast<char*>("nativeGetInputSampleRate"), const_cast<char*>("(J)I"), reinterpret_cast<void*>(native_get_input_sample_rate)},
+    {const_cast<char*>("nativeGetOutputSampleRate"), const_cast<char*>("(J)I"), reinterpret_cast<void*>(native_get_output_sample_rate)},
+    {const_cast<char*>("nativeGetMissingRequiredComponents"), const_cast<char*>("(J)[Ljava/lang/String;"), reinterpret_cast<void*>(native_get_missing_required_components)},
+};
+
+} // namespace
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK or env == nullptr) {
+        return JNI_ERR;
+    }
+    jclass bindings = env->FindClass("top/yurin/voxcpm2/internal/JniBindings");
+    if (bindings == nullptr) {
+        return JNI_ERR;
+    }
+    const jint result = env->RegisterNatives(
+        bindings,
+        kMethods,
+        static_cast<jint>(sizeof(kMethods) / sizeof(kMethods[0])));
+    env->DeleteLocalRef(bindings);
+    return result == JNI_OK ? JNI_VERSION_1_6 : JNI_ERR;
 }

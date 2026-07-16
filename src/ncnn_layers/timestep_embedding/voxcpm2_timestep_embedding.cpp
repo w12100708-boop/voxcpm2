@@ -7,6 +7,7 @@
 #include "voxcpm2_timestep_embedding.h"
 
 #include "../spirv_cache.h"
+#include "../../embed_support.h"
 
 #include <algorithm>
 #include <cmath>

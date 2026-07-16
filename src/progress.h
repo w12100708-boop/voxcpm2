@@ -16,6 +16,7 @@ enum class Phase {
     prefix,
     generation,
     decode,
+    smoke,
     write,
 };
 

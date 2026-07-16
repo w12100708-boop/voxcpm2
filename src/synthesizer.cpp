@@ -686,11 +686,15 @@ public:
             throw std::runtime_error(msg);
         }
 
+        progress::begin_phase(progress::Phase::smoke, "smoke", 11);
+        progress::current("text_embed", 1, 11);
         print_mat_shape("text_embed", run_single_input(net(Component::text_embed), make_i64_input(4, 1)));
+        progress::advance_phase("text_embed");
         auto smoke_decoders = [this, &profile](auto& base_cache, auto& residual_cache) {
             ncnn::Mat cos_cache;
             ncnn::Mat sin_cache;
             make_rope_cache(0, 2, cos_cache, sin_cache);
+            progress::current("base_decoder_kv", 2, 11);
             ncnn::Mat out = run_decoder_with_kv(
                 net(Component::base_decoder_kv),
                 make_f32_input(hidden_size_, 2),
@@ -704,7 +708,9 @@ public:
                 throw std::runtime_error("base_decoder_kv smoke output shape mismatch");
             }
             print_mat_shape("base_decoder_kv", out);
+            progress::advance_phase("base_decoder_kv");
 
+            progress::current("residual_decoder_kv", 3, 11);
             out = run_decoder_with_kv(
                 net(Component::residual_decoder_kv),
                 make_f32_input(hidden_size_, 2),
@@ -718,6 +724,7 @@ public:
                 throw std::runtime_error("residual_decoder_kv smoke output shape mismatch");
             }
             print_mat_shape("residual_decoder_kv", out);
+            progress::advance_phase("residual_decoder_kv");
         };
 
         if (use_vulkan_) {
@@ -741,14 +748,23 @@ public:
             HostDecoderKvCache residual_cache(residual_attn_count_, rope_head_dim_, kv_head_count_);
             smoke_decoders(base_cache, residual_cache);
         }
+        progress::current("feat_encoder", 4, 11);
         print_mat_shape("feat_encoder", run_single_input(net(Component::feat_encoder), make_f32_input(feat_dim_, patch_size_)));
+        progress::advance_phase("feat_encoder");
+        progress::current("fsq", 5, 11);
         print_mat_shape("fsq", run_single_input(net(Component::fsq), make_f32_input(hidden_size_, 1)));
+        progress::advance_phase("fsq");
+        progress::current("fusion_proj", 6, 11);
         print_mat_shape(
             "fusion_proj",
             run_net(net(Component::fusion_proj), {make_f32_input(hidden_size_, 1), make_f32_input(hidden_size_, 1)}));
+        progress::advance_phase("fusion_proj");
+        progress::current("dit_proj", 7, 11);
         print_mat_shape(
             "dit_proj",
             run_net(net(Component::dit_proj), {make_f32_input(hidden_size_, 1), make_f32_input(hidden_size_, 1)}));
+        progress::advance_phase("dit_proj");
+        progress::current("dit_estimator", 8, 11);
         print_mat_shape(
             "dit_estimator",
             run_net(
@@ -760,9 +776,17 @@ public:
                     make_f32_input(patch_size_, feat_dim_, 2),
                     make_f32_input(2, 1),
                 }));
+        progress::advance_phase("dit_estimator");
+        progress::current("stop_head", 9, 11);
         print_mat_shape("stop_head", run_single_input(net(Component::stop_head), make_f32_input(hidden_size_, 1)));
+        progress::advance_phase("stop_head");
+        progress::current("audio_vae_encoder", 10, 11);
         print_mat_shape("audio_vae_encoder", run_single_input(net(Component::audio_vae_encoder), make_f32_input(patch_size_ * chunk_size_ * 2, 1)));
+        progress::advance_phase("audio_vae_encoder");
+        progress::current("audio_vae_decoder", 11, 11);
         print_mat_shape("audio_vae_decoder", run_single_input(net(Component::audio_vae_decoder), make_f32_input(patch_size_ * 2, latent_dim_)));
+        progress::advance_phase("audio_vae_decoder");
+        progress::finish_phase("smoke");
     }
 
     int input_sample_rate() const {

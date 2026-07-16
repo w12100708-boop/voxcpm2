@@ -68,6 +68,8 @@ int phase_weight_for(voxcpm2::progress::Phase phase) {
         return 65;
     case decode:
         return 4;
+    case smoke:
+        return 100;
     case write:
         return 1;
     }
