@@ -12,20 +12,22 @@ option("profile")
     add_defines("VOXCPM2_ENABLE_PROFILE")
 option_end()
 
-add_requires("ncnn master", { configs = { vulkan = true } })
+add_requires("ncnn master", { configs = { vulkan = true, simpleomp = is_plat("android") } })
 add_requires("nlohmann_json")
-add_requires("cli11")
-add_requires("indicators")
-add_requires("crow v1.3.2", { configs = { ssl = false, zlib = false } })
-add_requires("ffmpeg", {
-    system = true,
-    configs = {
-        avcodec = true,
-        avformat = true,
-        avutil = true,
-        swresample = true,
-    },
-})
+if not is_plat("android") then
+    add_requires("cli11")
+    add_requires("indicators")
+    add_requires("crow v1.3.2", { configs = { ssl = false, zlib = false } })
+    add_requires("ffmpeg", {
+        system = true,
+        configs = {
+            avcodec = true,
+            avformat = true,
+            avutil = true,
+            swresample = true,
+        },
+    })
+end
 
 target("voxcpm2_ncnn")
     set_kind("static")
@@ -37,6 +39,26 @@ target("voxcpm2_ncnn")
     end
     add_packages("ncnn", { public = true })
     add_packages("nlohmann_json")
+
+target("voxcpm2_ncnn_shared")
+    set_kind("shared")
+    set_basename("voxcpm2_ncnn")
+    set_targetdir("$(builddir)/$(plat)/$(arch)/$(mode)/shared")
+    add_rules("utils.symbols.export_all", { export_classes = true })
+    add_options("profile")
+    add_includedirs("include", { public = true })
+    add_files("src/kvcache.cpp", "src/model_manifest.cpp", "src/ncnn_layers/dtype_adapter/voxcpm2_dtype_adapter.cpp", "src/ncnn_layers/sdpa/voxcpm2_sdpa.cpp", "src/ncnn_layers/timestep_embedding/voxcpm2_timestep_embedding.cpp", "src/progress.cpp", "src/synthesizer.cpp", "src/tokenizer.cpp")
+    if has_config("profile") then
+        add_files("src/profile.cpp")
+    end
+    add_packages("ncnn", { public = true })
+    add_packages("nlohmann_json")
+
+target("voxcpm2_jni")
+    set_kind("shared")
+    add_includedirs("include")
+    add_files("src/jni.cpp")
+    add_deps("voxcpm2_ncnn_shared")
 
 target("voxcpm2_audio_ffmpeg")
     set_kind("static")
@@ -112,6 +134,14 @@ target("test_server_api")
     set_rundir("$(projectdir)")
     add_tests("default")
 
+target("test_shared_library")
+    set_kind("binary")
+    set_group("test")
+    add_files("tests/test_shared_library.cpp")
+    add_deps("voxcpm2_ncnn_shared")
+    set_rundir("$(projectdir)")
+    add_tests("default")
+
 target("test_kvcache")
     set_kind("binary")
     set_group("test")
@@ -148,3 +178,34 @@ target("test_voxcpm2_dtype_adapter")
     add_packages("ncnn")
     set_rundir("$(projectdir)")
     add_tests("default")
+
+if is_plat("android") then
+    for _, name in ipairs({
+        "voxcpm2_audio_ffmpeg",
+        "voxcpm2",
+        "voxcpm2-server",
+        "test_progress",
+        "test_tokenizer",
+        "test_model_manifest",
+        "test_api_contract",
+        "test_audio_io",
+        "test_server_api",
+        "test_shared_library",
+        "test_kvcache",
+        "test_voxcpm2_sdpa",
+        "test_voxcpm2_timestep_embedding",
+        "test_voxcpm2_dtype_adapter",
+    }) do
+        target(name)
+            set_default(false)
+            before_build(function (target)
+                raise("target(%s) is not supported on Android", target:name())
+            end)
+    end
+else
+    target("voxcpm2_jni")
+        set_default(false)
+        before_build(function (target)
+            raise("target(%s) is only supported on Android", target:name())
+        end)
+end
