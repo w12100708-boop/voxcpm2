@@ -119,6 +119,11 @@ xmake build voxcpm2-server
 xmake run voxcpm2-server --vulkan
 ```
 
+The default `--threads 0` uses ncnn's CPU topology: physical performance cores
+for CPU inference, and a smaller host team plus all logical performance cores
+for the CPU-heavy audio VAE portions of Vulkan inference. Pass a positive value
+to override the automatic policy for power or thermal constraints.
+
 The default address is `127.0.0.1:8000`. Use `--host 0.0.0.0` to listen on all
 interfaces; the server does not provide authentication. Health is available at
 `GET /healthz`.

@@ -30,7 +30,7 @@ struct ServerOptions {
     int min_patches = 2;
     int timesteps = 10;
     float cfg_value = 2.0f;
-    int threads = 4;
+    int threads = 0;
     int vulkan_device = 0;
     bool vulkan = false;
 #ifdef VOXCPM2_ENABLE_PROFILE
@@ -74,8 +74,8 @@ int main(int argc, char** argv) {
         ->check(CLI::PositiveNumber)
         ->capture_default_str();
     app_cli.add_option("--cfg-value", cli.cfg_value, "Classifier-free guidance value")->capture_default_str();
-    app_cli.add_option("--threads", cli.threads, "CPU inference threads")
-        ->check(CLI::PositiveNumber)
+    app_cli.add_option("--threads", cli.threads, "CPU inference threads; 0 selects a topology-aware default")
+        ->check(CLI::NonNegativeNumber)
         ->capture_default_str();
     app_cli.add_option("--vulkan-device", cli.vulkan_device, "Vulkan device index")->capture_default_str();
     app_cli.add_flag("--vulkan", cli.vulkan, "Enable Vulkan compute");

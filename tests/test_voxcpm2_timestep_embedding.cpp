@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "ncnn_layers/timestep_embedding/voxcpm2_timestep_embedding.h"
+#include "ncnn_layers/spirv_cache.h"
 
 #include <algorithm>
 #include <cmath>
@@ -160,8 +161,16 @@ int main() {
 #if NCNN_VULKAN
         ncnn::create_gpu_instance();
         try {
+            const voxcpm2::runtime::SpirvCacheStats cache_before = voxcpm2::runtime::spirv_cache_stats();
             check_close(run_graph(true, 0, raw_timesteps[0], raw_timesteps[1]), raw_ref, 8e-2f, "vulkan raw");
             check_close(run_graph(true, 1, 1.0f, 10.0f), scheduled_ref, 8e-2f, "vulkan schedule");
+            const voxcpm2::runtime::SpirvCacheStats cache_after = voxcpm2::runtime::spirv_cache_stats();
+            if (cache_after.compile_calls - cache_before.compile_calls != 1) {
+                throw std::runtime_error("timestep shader should compile exactly once");
+            }
+            if (cache_after.cache_hits - cache_before.cache_hits != 1) {
+                throw std::runtime_error("second timestep graph should reuse cached SPIR-V");
+            }
         } catch (...) {
             ncnn::destroy_gpu_instance();
             throw;

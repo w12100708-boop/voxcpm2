@@ -30,7 +30,8 @@ struct SynthesizerConfig {
     std::filesystem::path model_dir = "assets/voxcpm2";
     bool use_vulkan = false;
     bool profile = false;
-    int threads = 4;
+    // 0 selects topology-aware thread counts from ncnn's CPU information.
+    int threads = 0;
     int vulkan_device = 0;
 };
 

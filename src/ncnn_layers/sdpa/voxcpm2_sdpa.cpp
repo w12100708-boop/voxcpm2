@@ -6,6 +6,8 @@
 
 #include "voxcpm2_sdpa.h"
 
+#include "../spirv_cache.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -41,8 +43,13 @@ constexpr char kSdpaFaCmComp[] = {
     , 0
 };
 
-int compile_shader(const char* data, int size, const ncnn::Option& opt, std::vector<unsigned int>& spirv) {
-    return ncnn::compile_spirv_module(data, size, opt, spirv);
+int compile_shader(
+    SpirvShader shader,
+    const char* data,
+    int size,
+    const ncnn::Option& opt,
+    SpirvModule& spirv) {
+    return get_cached_spirv(shader, data, size, opt, spirv);
 }
 #endif
 
@@ -273,17 +280,27 @@ int VoxCPM2SDPA::create_pipeline(const ncnn::Option& opt) {
         use_flash_attention = ((support_subgroup_ops & required_subgroup_ops) == required_subgroup_ops);
     }
 
-    std::vector<unsigned int> spirv_cross;
-    int ret = compile_shader(kSdpaCrossComp, static_cast<int>(sizeof(kSdpaCrossComp) - 1), opt, spirv_cross);
+    SpirvModule spirv_cross;
+    int ret = compile_shader(
+        SpirvShader::sdpa_cross,
+        kSdpaCrossComp,
+        static_cast<int>(sizeof(kSdpaCrossComp) - 1),
+        opt,
+        spirv_cross);
     if (ret != 0) {
         return ret;
     }
 
-    std::vector<unsigned int> spirv_cross_cm;
-    std::vector<unsigned int> spirv_fa;
-    std::vector<unsigned int> spirv_fa_cm;
+    SpirvModule spirv_cross_cm;
+    SpirvModule spirv_fa;
+    SpirvModule spirv_fa_cm;
     if (use_cooperative_matrix) {
-        ret = compile_shader(kSdpaCrossCmComp, static_cast<int>(sizeof(kSdpaCrossCmComp) - 1), opt, spirv_cross_cm);
+        ret = compile_shader(
+            SpirvShader::sdpa_cross_cooperative_matrix,
+            kSdpaCrossCmComp,
+            static_cast<int>(sizeof(kSdpaCrossCmComp) - 1),
+            opt,
+            spirv_cross_cm);
         if (ret != 0) {
             return ret;
         }
@@ -291,7 +308,13 @@ int VoxCPM2SDPA::create_pipeline(const ncnn::Option& opt) {
     if (use_flash_attention) {
         const char* fa_comp = use_cooperative_matrix ? kSdpaFaCmComp : kSdpaFaComp;
         const int fa_comp_size = use_cooperative_matrix ? static_cast<int>(sizeof(kSdpaFaCmComp) - 1) : static_cast<int>(sizeof(kSdpaFaComp) - 1);
-        ret = compile_shader(fa_comp, fa_comp_size, opt, use_cooperative_matrix ? spirv_fa_cm : spirv_fa);
+        ret = compile_shader(
+            use_cooperative_matrix ? SpirvShader::sdpa_flash_attention_cooperative_matrix
+                                   : SpirvShader::sdpa_flash_attention,
+            fa_comp,
+            fa_comp_size,
+            opt,
+            use_cooperative_matrix ? spirv_fa_cm : spirv_fa);
         if (ret != 0) {
             return ret;
         }
@@ -333,7 +356,10 @@ int VoxCPM2SDPA::create_pipeline(const ncnn::Option& opt) {
                     pipeline_sdpa_fa[i] = new ncnn::Pipeline(vkdev);
                     pipeline_sdpa_fa[i]->set_subgroup_size(FA_coopmat_subgroup_size);
                     pipeline_sdpa_fa[i]->set_local_size_xyz(FA_coopmat_subgroup_size * FA_UNROLL_WG_M, 1, 1);
-                    const int create_ret = pipeline_sdpa_fa[i]->create(spirv_fa_cm.data(), spirv_fa_cm.size() * sizeof(unsigned int), specializations);
+                    const int create_ret = pipeline_sdpa_fa[i]->create(
+                        spirv_fa_cm->data(),
+                        spirv_fa_cm->size() * sizeof(std::uint32_t),
+                        specializations);
                     if (create_ret != 0) {
                         return create_ret;
                     }
@@ -361,7 +387,10 @@ int VoxCPM2SDPA::create_pipeline(const ncnn::Option& opt) {
                 pipeline_sdpa_fa[i] = new ncnn::Pipeline(vkdev);
                 pipeline_sdpa_fa[i]->set_subgroup_size(subgroup_size);
                 pipeline_sdpa_fa[i]->set_local_size_xyz(subgroup_size * FA_UNROLL_WG_M, 1, 1);
-                const int create_ret = pipeline_sdpa_fa[i]->create(spirv_fa.data(), spirv_fa.size() * sizeof(unsigned int), specializations);
+                const int create_ret = pipeline_sdpa_fa[i]->create(
+                    spirv_fa->data(),
+                    spirv_fa->size() * sizeof(std::uint32_t),
+                    specializations);
                 if (create_ret != 0) {
                     return create_ret;
                 }
@@ -413,7 +442,10 @@ int VoxCPM2SDPA::create_pipeline(const ncnn::Option& opt) {
         pipeline_sdpa_qk_cross = new ncnn::Pipeline(vkdev);
         pipeline_sdpa_qk_cross->set_subgroup_size(coopmat_subgroup_size);
         pipeline_sdpa_qk_cross->set_local_size_xyz(coopmat_subgroup_size * UNROLL_WG_M * UNROLL_WG_N, 1, 1);
-        int create_ret = pipeline_sdpa_qk_cross->create(spirv_cross_cm.data(), spirv_cross_cm.size() * sizeof(unsigned int), specializations);
+        int create_ret = pipeline_sdpa_qk_cross->create(
+            spirv_cross_cm->data(),
+            spirv_cross_cm->size() * sizeof(std::uint32_t),
+            specializations);
         if (create_ret != 0) {
             return create_ret;
         }
@@ -444,7 +476,10 @@ int VoxCPM2SDPA::create_pipeline(const ncnn::Option& opt) {
         pipeline_sdpa_qkv_cross = new ncnn::Pipeline(vkdev);
         pipeline_sdpa_qkv_cross->set_subgroup_size(coopmat_subgroup_size);
         pipeline_sdpa_qkv_cross->set_local_size_xyz(coopmat_subgroup_size * UNROLL_WG_M * UNROLL_WG_N, 1, 1);
-        create_ret = pipeline_sdpa_qkv_cross->create(spirv_cross_cm.data(), spirv_cross_cm.size() * sizeof(unsigned int), specializations);
+        create_ret = pipeline_sdpa_qkv_cross->create(
+            spirv_cross_cm->data(),
+            spirv_cross_cm->size() * sizeof(std::uint32_t),
+            specializations);
         if (create_ret != 0) {
             return create_ret;
         }
@@ -467,7 +502,10 @@ int VoxCPM2SDPA::create_pipeline(const ncnn::Option& opt) {
 
             pipeline_sdpa_qk_cross = new ncnn::Pipeline(vkdev);
             pipeline_sdpa_qk_cross->set_local_size_xyz(8, 8, 1);
-            const int create_ret = pipeline_sdpa_qk_cross->create(spirv_cross.data(), spirv_cross.size() * sizeof(unsigned int), specializations);
+            const int create_ret = pipeline_sdpa_qk_cross->create(
+                spirv_cross->data(),
+                spirv_cross->size() * sizeof(std::uint32_t),
+                specializations);
             if (create_ret != 0) {
                 return create_ret;
             }
@@ -491,7 +529,10 @@ int VoxCPM2SDPA::create_pipeline(const ncnn::Option& opt) {
 
             pipeline_sdpa_qkv_cross = new ncnn::Pipeline(vkdev);
             pipeline_sdpa_qkv_cross->set_local_size_xyz(8, 8, 1);
-            const int create_ret = pipeline_sdpa_qkv_cross->create(spirv_cross.data(), spirv_cross.size() * sizeof(unsigned int), specializations);
+            const int create_ret = pipeline_sdpa_qkv_cross->create(
+                spirv_cross->data(),
+                spirv_cross->size() * sizeof(std::uint32_t),
+                specializations);
             if (create_ret != 0) {
                 return create_ret;
             }

@@ -6,6 +6,8 @@
 
 #include "voxcpm2_dtype_adapter.h"
 
+#include "../spirv_cache.h"
+
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -82,8 +84,13 @@ int VoxCPM2DTypeAdapter::create_pipeline(const ncnn::Option& opt) {
         return 0;
     }
 
-    std::vector<unsigned int> spirv;
-    int ret = ncnn::compile_spirv_module(kDTypeAdapterComp, static_cast<int>(sizeof(kDTypeAdapterComp) - 1), opt, spirv);
+    SpirvModule spirv;
+    int ret = get_cached_spirv(
+        SpirvShader::dtype_adapter,
+        kDTypeAdapterComp,
+        static_cast<int>(sizeof(kDTypeAdapterComp) - 1),
+        opt,
+        spirv);
     if (ret != 0) {
         return ret;
     }
@@ -93,7 +100,10 @@ int VoxCPM2DTypeAdapter::create_pipeline(const ncnn::Option& opt) {
 
     pipeline_fp16_to_fp32 = new ncnn::Pipeline(vkdev);
     pipeline_fp16_to_fp32->set_local_size_xyz(64, 1, 1);
-    return pipeline_fp16_to_fp32->create(spirv.data(), spirv.size() * sizeof(unsigned int), specializations);
+    return pipeline_fp16_to_fp32->create(
+        spirv->data(),
+        spirv->size() * sizeof(std::uint32_t),
+        specializations);
 #else
     (void)opt;
     return 0;

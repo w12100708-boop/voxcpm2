@@ -6,6 +6,8 @@
 
 #include "voxcpm2_timestep_embedding.h"
 
+#include "../spirv_cache.h"
+
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -82,8 +84,13 @@ int VoxCPM2TimestepEmbedding::create_pipeline(const ncnn::Option& opt) {
         return 0;
     }
 
-    std::vector<unsigned int> spirv;
-    int ret = ncnn::compile_spirv_module(kTimestepEmbeddingComp, static_cast<int>(sizeof(kTimestepEmbeddingComp) - 1), opt, spirv);
+    SpirvModule spirv;
+    int ret = get_cached_spirv(
+        SpirvShader::timestep_embedding,
+        kTimestepEmbeddingComp,
+        static_cast<int>(sizeof(kTimestepEmbeddingComp) - 1),
+        opt,
+        spirv);
     if (ret != 0) {
         return ret;
     }
@@ -96,7 +103,10 @@ int VoxCPM2TimestepEmbedding::create_pipeline(const ncnn::Option& opt) {
 
     pipeline_embedding = new ncnn::Pipeline(vkdev);
     pipeline_embedding->set_local_size_xyz(64, 1, 1);
-    return pipeline_embedding->create(spirv.data(), spirv.size() * sizeof(unsigned int), specializations);
+    return pipeline_embedding->create(
+        spirv->data(),
+        spirv->size() * sizeof(std::uint32_t),
+        specializations);
 #else
     (void)opt;
     return 0;

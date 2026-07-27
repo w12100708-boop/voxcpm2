@@ -40,7 +40,7 @@ struct CliOptions {
     int min_patches = 2;
     int timesteps = 10;
     float cfg_value = 2.0f;
-    int threads = 4;
+    int threads = 0;
     int vulkan_device = 0;
     bool vulkan = false;
     bool no_progress = false;
@@ -224,7 +224,9 @@ int main(int argc, char** argv) {
         ->capture_default_str();
     app.add_option("--timesteps", cli.timesteps, "CFM Euler steps per generated patch")->capture_default_str();
     app.add_option("--cfg-value", cli.cfg_value, "Classifier-free guidance value")->capture_default_str();
-    app.add_option("--threads", cli.threads, "CPU worker threads")->capture_default_str();
+    app.add_option("--threads", cli.threads, "CPU worker threads; 0 selects a topology-aware default")
+        ->check(CLI::NonNegativeNumber)
+        ->capture_default_str();
     app.add_option("--vulkan-device", cli.vulkan_device, "Vulkan device index")->capture_default_str();
     app.add_flag("--vulkan", cli.vulkan, "Enable Vulkan compute");
     app.add_flag("--no-progress", cli.no_progress, "Disable synthesis progress bars");

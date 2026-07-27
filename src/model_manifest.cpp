@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <exception>
 #include <format>
 #include <fstream>
 #include <stdexcept>

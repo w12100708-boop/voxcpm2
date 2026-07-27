@@ -24,14 +24,15 @@
 #include <format>
 #include <memory>
 #include <numbers>
-#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
+#include <cpu.h>
 #include <mat.h>
 #include <net.h>
+#include <pipelinecache.h>
 
 namespace voxcpm2 {
 namespace {
@@ -217,6 +218,23 @@ int max_patches_for_target(int target_text_token_count, int hard_cap) {
     return std::max(1, std::min(hard_cap, stop_token_cap));
 }
 
+int resolve_thread_count(int requested) {
+    if (requested < 0) [[unlikely]] {
+        throw std::invalid_argument("thread count must not be negative");
+    }
+    if (requested > 0) {
+        return requested;
+    }
+    return std::max(1, ncnn::get_physical_big_cpu_count());
+}
+
+int resolve_audio_thread_count(int requested) {
+    if (requested > 0) {
+        return requested;
+    }
+    return std::max(1, ncnn::get_big_cpu_count());
+}
+
 void pad_audio_to_patch(std::vector<float>& samples, int patch_len, bool left_pad) {
     if (patch_len <= 0) [[unlikely]] {
         throw std::runtime_error("invalid VoxCPM2 audio patch length");
@@ -241,18 +259,38 @@ public:
         : model_dir_(std::move(config.model_dir)),
           use_vulkan_(config.use_vulkan),
           profile_(config.profile),
-          threads_(config.threads > 0 ? config.threads : 4),
+          automatic_threads_(config.threads == 0),
+          threads_(resolve_thread_count(config.threads)),
+          audio_threads_(resolve_audio_thread_count(config.threads)),
           vulkan_device_(config.vulkan_device) {
 #if NCNN_VULKAN
         if (use_vulkan_) {
             ncnn::create_gpu_instance();
+            if (const ncnn::VulkanDevice* vkdev = ncnn::get_gpu_device(vulkan_device_)) {
+                pipeline_cache_ = std::make_unique<ncnn::PipelineCache>(vkdev);
+            }
         }
 #endif
         Profile load_profile(profile_);
+        load_profile.count("host_threads", thread_count_for_net(Component::dit_estimator));
+        load_profile.count("audio_vae_threads", thread_count_for_net(Component::audio_vae_decoder));
+#if NCNN_VULKAN && defined(VOXCPM2_ENABLE_PROFILE)
+        const SpirvCacheStats spirv_before = spirv_cache_stats();
+#endif
         {
             auto timing = load_profile.scope("assets_and_tokenizer");
             load_manifest();
         }
+#if NCNN_VULKAN && defined(VOXCPM2_ENABLE_PROFILE)
+        if (use_vulkan_) {
+            const SpirvCacheStats spirv_after = spirv_cache_stats();
+            load_profile.count("spirv_compile_calls", spirv_after.compile_calls - spirv_before.compile_calls);
+            load_profile.count("spirv_cache_hits", spirv_after.cache_hits - spirv_before.cache_hits);
+            if (pipeline_cache_) {
+                load_profile.count("pipeline_cache_entries", static_cast<std::uint64_t>(pipeline_cache_->size()));
+            }
+        }
+#endif
         load_profile.report("model_load");
     }
 
@@ -262,6 +300,7 @@ public:
         }
 #if NCNN_VULKAN
         if (use_vulkan_) {
+            pipeline_cache_.reset();
             ncnn::destroy_gpu_instance();
         }
 #endif
@@ -915,7 +954,7 @@ private:
 
     ncnn::Option option_for_net(Component component) const {
         ncnn::Option opt;
-        opt.num_threads = threads_;
+        opt.num_threads = thread_count_for_net(component);
         opt.use_bf16_storage = false;
         opt.use_bf16_packed = false;
         opt.use_fp16_storage = true;
@@ -925,7 +964,13 @@ private:
         opt.use_int8_storage = false;
         opt.use_int8_packed = false;
         opt.use_int8_arithmetic = false;
+        opt.use_mapped_model_loading = true;
         opt.use_vulkan_compute = use_vulkan_;
+#if NCNN_VULKAN
+        if (use_vulkan_) {
+            opt.pipeline_cache = pipeline_cache_.get();
+        }
+#endif
         if (component_spec(component).dual_backend and not use_vulkan_) {
             // CPU paths stay in fp32 storage; Vulkan paths use fp16 with
             // RMSNorm isolated via VoxCPM2DTypeAdapter.
@@ -935,13 +980,30 @@ private:
         return opt;
     }
 
+    int thread_count_for_net(Component component) const {
+        if (not automatic_threads_ or not use_vulkan_) {
+            return threads_;
+        }
+        if (component == Component::audio_vae_encoder or component == Component::audio_vae_decoder) {
+            return audio_threads_;
+        }
+        // Keep the established four-thread host path for GPU-backed graphs;
+        // larger OpenMP teams slow their small CPU fragments down.
+        return std::min(threads_, 4);
+    }
+
     std::filesystem::path model_dir_;
     Tokenizer tokenizer_;
     std::array<std::unique_ptr<ncnn::Net>, static_cast<std::size_t>(Component::count)> nets_;
     bool use_vulkan_ = false;
     bool profile_ = false;
-    int threads_ = 4;
+    bool automatic_threads_ = true;
+    int threads_ = 1;
+    int audio_threads_ = 1;
     int vulkan_device_ = 0;
+#if NCNN_VULKAN
+    std::unique_ptr<ncnn::PipelineCache> pipeline_cache_;
+#endif
 
     int hidden_size_ = 2048;
     int patch_size_ = 0;
