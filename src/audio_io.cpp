@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -80,47 +81,90 @@ void validate_audio(const AudioBuffer& audio) {
     }
 }
 
-bool sample_format_supported(const AVCodec* codec, AVSampleFormat format) {
+// FFmpeg 7.1 deprecated and newer releases removed direct access to the AVCodec
+// capability arrays; avcodec_get_supported_config is the supported replacement.
+// Both helpers return an empty vector when the codec accepts anything.
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
+std::vector<AVSampleFormat> supported_sample_formats(const AVCodec* codec) {
+    const void* configs = nullptr;
+    int count = 0;
+    avcodec_get_supported_config(nullptr, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &configs, &count);
+    if (configs == nullptr or count <= 0) {
+        return {};
+    }
+    const auto* formats = static_cast<const AVSampleFormat*>(configs);
+    return {formats, formats + count};
+}
+
+std::vector<int> supported_sample_rates(const AVCodec* codec) {
+    const void* configs = nullptr;
+    int count = 0;
+    avcodec_get_supported_config(nullptr, codec, AV_CODEC_CONFIG_SAMPLE_RATE, 0, &configs, &count);
+    if (configs == nullptr or count <= 0) {
+        return {};
+    }
+    const auto* rates = static_cast<const int*>(configs);
+    return {rates, rates + count};
+}
+#else
+std::vector<AVSampleFormat> supported_sample_formats(const AVCodec* codec) {
     if (codec->sample_fmts == nullptr) {
-        return true;
+        return {};
     }
+    std::vector<AVSampleFormat> formats;
     for (const AVSampleFormat* p = codec->sample_fmts; *p != AV_SAMPLE_FMT_NONE; ++p) {
-        if (*p == format) {
-            return true;
-        }
+        formats.push_back(*p);
     }
-    return false;
+    return formats;
+}
+
+std::vector<int> supported_sample_rates(const AVCodec* codec) {
+    if (codec->supported_samplerates == nullptr) {
+        return {};
+    }
+    std::vector<int> rates;
+    for (const int* p = codec->supported_samplerates; *p != 0; ++p) {
+        rates.push_back(*p);
+    }
+    return rates;
+}
+#endif
+
+bool sample_format_supported(const std::vector<AVSampleFormat>& formats, AVSampleFormat format) {
+    return formats.empty() or std::find(formats.begin(), formats.end(), format) != formats.end();
 }
 
 AVSampleFormat choose_sample_format(const AVCodec* codec) {
-    if (sample_format_supported(codec, AV_SAMPLE_FMT_FLT)) {
+    const auto formats = supported_sample_formats(codec);
+    if (sample_format_supported(formats, AV_SAMPLE_FMT_FLT)) {
         return AV_SAMPLE_FMT_FLT;
     }
-    if (sample_format_supported(codec, AV_SAMPLE_FMT_FLTP)) {
+    if (sample_format_supported(formats, AV_SAMPLE_FMT_FLTP)) {
         return AV_SAMPLE_FMT_FLTP;
     }
-    if (sample_format_supported(codec, AV_SAMPLE_FMT_S16)) {
+    if (sample_format_supported(formats, AV_SAMPLE_FMT_S16)) {
         return AV_SAMPLE_FMT_S16;
     }
-    if (sample_format_supported(codec, AV_SAMPLE_FMT_S16P)) {
+    if (sample_format_supported(formats, AV_SAMPLE_FMT_S16P)) {
         return AV_SAMPLE_FMT_S16P;
     }
-    if (codec->sample_fmts != nullptr and codec->sample_fmts[0] != AV_SAMPLE_FMT_NONE) {
-        return codec->sample_fmts[0];
+    if (not formats.empty()) {
+        return formats.front();
     }
     return AV_SAMPLE_FMT_FLT;
 }
 
 int choose_sample_rate(const AVCodec* codec, int requested) {
-    if (codec->supported_samplerates == nullptr) {
+    const auto rates = supported_sample_rates(codec);
+    if (rates.empty()) {
         return requested;
     }
-    int best = codec->supported_samplerates[0];
+    int best = rates.front();
     int best_delta = std::abs(best - requested);
-    for (const int* p = codec->supported_samplerates; *p != 0; ++p) {
-        const int delta = std::abs(*p - requested);
+    for (int rate : rates) {
+        const int delta = std::abs(rate - requested);
         if (delta < best_delta) {
-            best = *p;
+            best = rate;
             best_delta = delta;
         }
     }
