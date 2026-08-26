@@ -199,8 +199,8 @@ void validate_config(const voxcpm2_config* config) {
     if (config->model_dir_utf8 == nullptr or config->model_dir_utf8[0] == '\0') {
         throw std::invalid_argument("modelDir must not be empty");
     }
-    if (config->threads <= 0) {
-        throw std::invalid_argument("threads must be positive");
+    if (config->threads < 0) {
+        throw std::invalid_argument("threads must not be negative");
     }
     if (config->vulkan_device < 0) {
         throw std::invalid_argument("vulkanDevice must not be negative");
