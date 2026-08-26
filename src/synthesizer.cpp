@@ -11,6 +11,7 @@
 #include "kvcache.h"
 #include "model_manifest.h"
 #include "ncnn_layers/registry.h"
+#include "ncnn_layers/spirv_cache.h"
 #include "profile.h"
 #include "progress.h"
 #include "voxcpm2/tokenizer.h"
