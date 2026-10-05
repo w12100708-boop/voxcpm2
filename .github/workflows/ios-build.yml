@@ -1,0 +1,57 @@
+name: Build VoxCPM2 iOS Runtime
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install xmake
+        run: |
+          brew install xmake
+
+      - name: Build iPhone arm64 runtime
+        run: |
+          xmake f \
+            -p iphoneos \
+            -a arm64 \
+            -m release \
+            --appledev=iphone \
+            --profile=false
+
+          xmake build voxcpm2_ncnn_shared
+
+      - name: Locate build output
+        run: |
+          echo "=== Searching for VoxCPM2 library ==="
+          find build -type f \( \
+            -name "libvoxcpm2_ncnn*" \
+            -o -name "*.dylib" \
+            -o -name "*.a" \
+          \) -print || true
+
+      - name: Package runtime
+        run: |
+          mkdir -p artifact
+
+          find build -type f \
+            \( -name "libvoxcpm2_ncnn.dylib" \
+            -o -name "libvoxcpm2_ncnn.a" \) \
+            -exec cp {} artifact/ \; || true
+
+          echo "=== Artifact ==="
+          ls -lah artifact
+
+      - name: Upload runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: voxcpm2-ios-arm64-runtime
+          path: artifact/
