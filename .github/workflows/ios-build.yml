@@ -18,6 +18,44 @@ jobs:
         run: |
           brew install xmake
 
+      - name: Prepare ncnn RTTI
+        run: |
+          xmake repo --update
+
+          echo "=== Finding ncnn xmake recipe ==="
+          NCNN_RECIPE=$(find "$HOME/.xmake" \
+            -path "*/packages/n/ncnn/xmake.lua" \
+            -type f | head -n 1)
+
+          if [ -z "$NCNN_RECIPE" ]; then
+            echo "ERROR: ncnn xmake recipe not found"
+            exit 1
+          fi
+
+          echo "Found: $NCNN_RECIPE"
+
+          python3 - "$NCNN_RECIPE" <<'PY'
+          import sys
+          from pathlib import Path
+
+          p = Path(sys.argv[1])
+          s = p.read_text()
+
+          target = 'table.insert(configs, "-DNCNN_BUILD_EXAMPLES=OFF")'
+
+          if "-DNCNN_DISABLE_RTTI=OFF" not in s:
+              s = s.replace(
+                  target,
+                  target + '\ntable.insert(configs, "-DNCNN_DISABLE_RTTI=OFF")'
+              )
+
+          p.write_text(s)
+          print("RTTI patch applied.")
+          PY
+
+          echo "=== Checking RTTI patch ==="
+          grep -n "NCNN_DISABLE_RTTI" "$NCNN_RECIPE"
+
       - name: Build iPhone arm64 runtime
         run: |
           xmake f -y \
@@ -25,8 +63,7 @@ jobs:
             -a arm64 \
             -m release \
             --appledev=iphone \
-            --profile=false \
-            --rtti=true
+            --profile=false
 
           xmake build voxcpm2_ncnn_shared
 
