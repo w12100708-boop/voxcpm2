@@ -13,17 +13,108 @@ jobs:
       TEAM_ID: TRFB7RR82Y
 
     steps:
+
+      # ============================================================
+      # 1. 获取源码
+      # ============================================================
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
 
+      # ============================================================
+      # 2. 安装构建工具
+      # ============================================================
       - name: Install tools
         run: |
           brew install xmake xcodegen
 
-      - name: Build VoxCPM2 iOS runtime
+      # ============================================================
+      # 3. 修复 ncnn RTTI
+      # ============================================================
+      - name: Prepare ncnn RTTI
+        run: |
+          echo "Updating xmake repositories..."
+          xmake repo -u
+
+          echo "Finding ncnn recipe..."
+
+          NCNN_RECIPE="$HOME/.xmake/repositories/xmake-repo/packages/n/ncnn/xmake.lua"
+
+          if [ ! -f "$NCNN_RECIPE" ]; then
+            echo "ERROR: ncnn recipe not found:"
+            echo "$NCNN_RECIPE"
+            exit 1
+          fi
+
+          echo "Found:"
+          echo "$NCNN_RECIPE"
+
+          python3 - <<'PY'
+          import os
+
+          path = os.path.expanduser(
+              "~/.xmake/repositories/xmake-repo/packages/n/ncnn/xmake.lua"
+          )
+
+          with open(path, "r", encoding="utf-8") as f:
+              text = f.read()
+
+          # ncnn 的 iOS 构建默认关闭 RTTI。
+          # VoxCPM2 的自定义 Layer 需要 RTTI。
+          if "-DNCNN_DISABLE_RTTI=OFF" in text:
+              print("RTTI setting already exists.")
+          else:
+              candidates = [
+                  '            "-DNCNN_SYSTEM_GLSLANG=ON",',
+                  '        "-DNCNN_SYSTEM_GLSLANG=ON",',
+                  '"-DNCNN_SYSTEM_GLSLANG=ON",'
+              ]
+
+              inserted = False
+
+              for old in candidates:
+                  if old in text:
+                      new = old + '\n' + old.replace(
+                          "NCNN_SYSTEM_GLSLANG=ON",
+                          "NCNN_DISABLE_RTTI=OFF"
+                      )
+                      text = text.replace(old, new, 1)
+                      inserted = True
+                      break
+
+              if not inserted:
+                  # 如果 xmake-repo 的 ncnn 配方结构改变，
+                  # 不猜位置，直接停止。
+                  raise SystemExit(
+                      "ERROR: Cannot safely patch ncnn RTTI setting."
+                  )
+
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(text)
+
+              print("RTTI patch applied.")
+
+          print("=== Checking RTTI setting ===")
+
+          with open(path, "r", encoding="utf-8") as f:
+              for line in f:
+                  if "NCNN_DISABLE_RTTI" in line:
+                      print(line.rstrip())
+          PY
+
+      # ============================================================
+      # 4. 清理 ncnn 缓存
+      # ============================================================
+      - name: Clean ncnn cache
+        run: |
+          xmake require --clean ncnn || true
+
+      # ============================================================
+      # 5. 配置 iOS arm64
+      # ============================================================
+      - name: Configure iOS arm64
         run: |
           xmake f -y \
             -p iphoneos \
@@ -32,47 +123,106 @@ jobs:
             --appledev=iphone \
             --profile=false
 
+      # ============================================================
+      # 6. 编译 VoxCPM2
+      # ============================================================
+      - name: Build VoxCPM2 runtime
+        run: |
           xmake build voxcpm2_ncnn_shared
 
-      - name: Locate runtime
-        run: |
-          echo "=== Runtime files ==="
-          find build -type f \( \
-            -name "libvoxcpm2_ncnn*" \
-            -o -name "*.dylib" \
-            \) -print
+          echo "=== Searching runtime ==="
 
+          find build \
+            -type f \
+            \( \
+              -name "libvoxcpm2_ncnn.dylib" \
+              -o -name "*.dylib" \
+            \) \
+            -print
+
+      # ============================================================
+      # 7. 准备 App 文件夹
+      # ============================================================
+      - name: Prepare iOS project
+        run: |
+          mkdir -p VoxCPM2App/Sources
+          mkdir -p VoxCPM2App/Runtime
+
+      # ============================================================
+      # 8. 复制 runtime
+      # ============================================================
+      - name: Copy runtime
+        run: |
+          RUNTIME=$(find build \
+            -type f \
+            -name "libvoxcpm2_ncnn.dylib" \
+            | head -n 1)
+
+          if [ -z "$RUNTIME" ]; then
+            echo "ERROR: libvoxcpm2_ncnn.dylib not found."
+            exit 1
+          fi
+
+          echo "Runtime:"
+          echo "$RUNTIME"
+
+          cp "$RUNTIME" \
+            VoxCPM2App/Runtime/libvoxcpm2_ncnn.dylib
+
+      # ============================================================
+      # 9. 复制 C API
+      # ============================================================
+      - name: Copy C API
+        run: |
+          cp include/voxcpm2/c_api.h \
+            VoxCPM2App/Sources/c_api.h
+
+      # ============================================================
+      # 10. 下载 VoxCPM2 模型
+      # ============================================================
       - name: Download VoxCPM2 model
         run: |
-          mkdir -p VoxCPM2App/Model
-
-          git clone --depth 1 \
+          git clone \
+            --depth 1 \
             https://huggingface.co/lyrin/voxpm2-ncnn \
             VoxCPM2App/Model
 
           rm -rf VoxCPM2App/Model/.git
 
-          echo "=== Model ==="
+          echo "=== Model size ==="
           du -sh VoxCPM2App/Model
-          find VoxCPM2App/Model -maxdepth 1 -type f -print
 
-      - name: Create iOS source
+          echo "=== Model files ==="
+          find VoxCPM2App/Model \
+            -maxdepth 2 \
+            -type f \
+            -print
+
+      # ============================================================
+      # 11. Swift / C Bridge
+      # ============================================================
+      - name: Create bridge
         run: |
-          mkdir -p VoxCPM2App/Sources
 
           cat > VoxCPM2App/Sources/VoxCPM2Bridge.h <<'EOF'
           #include "c_api.h"
           EOF
 
-          cat > VoxCPM2App/Sources/VoxCPM2Bridge.swift <<'EOF'
+      # ============================================================
+      # 12. Swift VoxCPM2 Engine
+      # ============================================================
+      - name: Create VoxCPM2 Swift engine
+        run: |
+
+          cat > VoxCPM2App/Sources/VoxCPM2Engine.swift <<'EOF'
           import Foundation
 
           final class VoxCPM2Engine {
-              private var synthesizer: UnsafeMutablePointer<voxcpm2_synthesizer>?
-              private let modelURL: URL
+
+              private var synthesizer:
+                  UnsafeMutablePointer<voxcpm2_synthesizer>?
 
               init?(modelURL: URL) {
-                  self.modelURL = modelURL
 
                   var config = voxcpm2_config(
                       model_dir_utf8: modelURL.path,
@@ -87,14 +237,15 @@ jobs:
                       message: nil
                   )
 
-                  let status = voxcpm2_synthesizer_create(
-                      &config,
-                      nil,
-                      nil,
-                      nil,
-                      &synthesizer,
-                      &error
-                  )
+                  let status =
+                      voxcpm2_synthesizer_create(
+                          &config,
+                          nil,
+                          nil,
+                          nil,
+                          &synthesizer,
+                          &error
+                      )
 
                   voxcpm2_error_free(&error)
 
@@ -106,7 +257,9 @@ jobs:
 
               deinit {
                   if let synthesizer {
-                      voxcpm2_synthesizer_destroy(synthesizer)
+                      voxcpm2_synthesizer_destroy(
+                          synthesizer
+                      )
                   }
               }
 
@@ -121,59 +274,96 @@ jobs:
                           domain: "VoxCPM2",
                           code: -1,
                           userInfo: [
-                              NSLocalizedDescriptionKey: "VoxCPM2 初始化失败"
+                              NSLocalizedDescriptionKey:
+                                  "VoxCPM2 初始化失败"
                           ]
                       )
                   }
 
-                  var samples = referenceSamples
+                  var referenceView:
+                      voxcpm2_audio_view?
 
-                  let reference = samples.withUnsafeMutableBufferPointer { buffer in
-                      voxcpm2_audio_view(
-                          samples: buffer.baseAddress,
-                          sample_count: buffer.count,
-                          sample_rate: sampleRate,
-                          channels: 1
-                      )
+                  if !referenceSamples.isEmpty {
+
+                      referenceSamples.withUnsafeBufferPointer { buffer in
+
+                          referenceView =
+                              voxcpm2_audio_view(
+                                  samples: buffer.baseAddress,
+                                  sample_count: buffer.count,
+                                  sample_rate: sampleRate,
+                                  channels: 1
+                              )
+                      }
                   }
 
                   var options = voxcpm2_synthesis_options(
                       text_utf8: text,
                       prompt_text_utf8: nil,
                       prompt_audio: nil,
-                      reference_audio: referenceSamples.isEmpty ? nil : reference,
+                      reference_audio: nil,
                       min_patches: 2,
                       inference_timesteps: 20,
                       cfg_value: 2.0
                   )
 
-                  var output = voxcpm2_audio_buffer(
-                      samples: nil,
-                      sample_count: 0,
-                      sample_rate: 0,
-                      channels: 0
-                  )
+                  if let referenceView {
+                      options.reference_audio =
+                          UnsafePointer(
+                              .allocate(
+                                  capacity:
+                                      MemoryLayout<
+                                          voxcpm2_audio_view
+                                      >.stride
+                              )
+                          )
 
-                  var error = voxcpm2_error(
-                      code: VOXCPM2_STATUS_OK,
-                      message: nil
-                  )
+                      options.reference_audio?
+                          .initialize(
+                              to: referenceView
+                          )
+                  }
 
-                  let status = voxcpm2_synthesizer_generate(
-                      synthesizer,
-                      &options,
-                      nil,
-                      nil,
-                      nil,
-                      &output,
-                      &error
-                  )
+                  defer {
+                      if let ptr = options.reference_audio {
+                          ptr.deinitialize(count: 1)
+                          ptr.deallocate()
+                      }
+                  }
+
+                  var output =
+                      voxcpm2_audio_buffer(
+                          samples: nil,
+                          sample_count: 0,
+                          sample_rate: 0,
+                          channels: 0
+                      )
+
+                  var error =
+                      voxcpm2_error(
+                          code: VOXCPM2_STATUS_OK,
+                          message: nil
+                      )
+
+                  let status =
+                      voxcpm2_synthesizer_generate(
+                          synthesizer,
+                          &options,
+                          nil,
+                          nil,
+                          nil,
+                          &output,
+                          &error
+                      )
 
                   if status != VOXCPM2_STATUS_OK {
+
                       let message: String
 
                       if let ptr = error.message {
-                          message = String(cString: ptr)
+                          message = String(
+                              cString: ptr
+                          )
                       } else {
                           message = "VoxCPM2 生成失败"
                       }
@@ -184,36 +374,54 @@ jobs:
                           domain: "VoxCPM2",
                           code: Int(status.rawValue),
                           userInfo: [
-                              NSLocalizedDescriptionKey: message
+                              NSLocalizedDescriptionKey:
+                                  message
                           ]
                       )
                   }
 
                   voxcpm2_error_free(&error)
 
-                  guard let outputSamples = output.samples else {
+                  guard
+                      let outputSamples = output.samples
+                  else {
                       throw NSError(
                           domain: "VoxCPM2",
                           code: -2,
                           userInfo: [
-                              NSLocalizedDescriptionKey: "没有生成音频"
+                              NSLocalizedDescriptionKey:
+                                  "没有生成音频"
                           ]
                       )
                   }
 
                   let data = Data(
                       bytes: outputSamples,
-                      count: output.sample_count * MemoryLayout<Float>.size
+                      count:
+                          output.sample_count *
+                          MemoryLayout<Float>.size
                   )
 
-                  let rate = output.sample_rate
+                  let sampleRate =
+                      output.sample_rate
 
-                  voxcpm2_audio_buffer_free(&output)
+                  voxcpm2_audio_buffer_free(
+                      &output
+                  )
 
-                  return (data, rate)
+                  return (
+                      data,
+                      sampleRate
+                  )
               }
           }
           EOF
+
+      # ============================================================
+      # 13. iOS UI
+      # ============================================================
+      - name: Create SwiftUI app
+        run: |
 
           cat > VoxCPM2App/Sources/ContentView.swift <<'EOF'
           import SwiftUI
@@ -221,18 +429,30 @@ jobs:
           import UniformTypeIdentifiers
 
           struct ContentView: View {
-              @State private var referenceURL: URL?
-              @State private var targetText = "你好，这是 VoxCPM2 在 iPhone 上的语音生成测试。"
-              @State private var status = "请选择参考音频"
-              @State private var isGenerating = false
-              @State private var showingImporter = false
 
-              @State private var player: AVAudioPlayer?
+              @State private var referenceURL: URL?
+              @State private var targetText =
+                  "你好，这是 VoxCPM2 在 iPhone 上的语音生成测试。"
+
+              @State private var status =
+                  "请选择参考音频"
+
+              @State private var showingImporter =
+                  false
+
+              @State private var isGenerating =
+                  false
+
+              @State private var player:
+                  AVAudioPlayer?
 
               var body: some View {
+
                   NavigationStack {
+
                       ScrollView {
-                          VStack(spacing: 18) {
+
+                          VStack(spacing: 20) {
 
                               Text("VoxCPM2")
                                   .font(.largeTitle.bold())
@@ -241,35 +461,53 @@ jobs:
                                   .foregroundStyle(.secondary)
 
                               Button {
+
                                   showingImporter = true
+
                               } label: {
-                                  HStack {
-                                      Image(systemName: "waveform")
-                                      Text(
-                                          referenceURL == nil
-                                          ? "选择参考音频"
-                                          : "已选择参考音频"
-                                      )
-                                  }
-                                  .frame(maxWidth: .infinity)
+
+                                  Label(
+                                      referenceURL == nil
+                                      ? "选择参考音频"
+                                      : "重新选择参考音频",
+                                      systemImage:
+                                          "waveform"
+                                  )
+                                  .frame(
+                                      maxWidth: .infinity
+                                  )
                                   .padding()
                                   .background(.blue)
                                   .foregroundStyle(.white)
-                                  .clipShape(RoundedRectangle(cornerRadius: 14))
+                                  .clipShape(
+                                      RoundedRectangle(
+                                          cornerRadius: 14
+                                      )
+                                  )
                               }
 
-                              TextField(
-                                  "请输入要生成的文字",
-                                  text: $targetText,
-                                  axis: .vertical
+                              TextEditor(
+                                  text: $targetText
                               )
-                              .textFieldStyle(.roundedBorder)
-                              .lineLimit(4...8)
+                              .frame(height: 150)
+                              .padding(8)
+                              .overlay(
+                                  RoundedRectangle(
+                                      cornerRadius: 12
+                                  )
+                                  .stroke(
+                                      .gray.opacity(0.3)
+                                  )
+                              )
 
                               Button {
+
                                   generate()
+
                               } label: {
+
                                   HStack {
+
                                       if isGenerating {
                                           ProgressView()
                                               .tint(.white)
@@ -281,73 +519,124 @@ jobs:
                                           : "生成语音"
                                       )
                                   }
-                                  .frame(maxWidth: .infinity)
+                                  .frame(
+                                      maxWidth: .infinity
+                                  )
                                   .padding()
                                   .background(
-                                      isGenerating ? .gray : .green
+                                      isGenerating
+                                      ? .gray
+                                      : .green
                                   )
                                   .foregroundStyle(.white)
-                                  .clipShape(RoundedRectangle(cornerRadius: 14))
+                                  .clipShape(
+                                      RoundedRectangle(
+                                          cornerRadius: 14
+                                      )
+                                  )
                               }
                               .disabled(
                                   isGenerating ||
-                                  targetText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  targetText
+                                      .trimmingCharacters(
+                                          in: .whitespacesAndNewlines
+                                      )
+                                      .isEmpty
                               )
 
                               Text(status)
                                   .font(.footnote)
-                                  .foregroundStyle(.secondary)
-                                  .frame(maxWidth: .infinity, alignment: .leading)
-
+                                  .foregroundStyle(
+                                      .secondary
+                                  )
+                                  .frame(
+                                      maxWidth: .infinity,
+                                      alignment: .leading
+                                  )
                           }
                           .padding()
                       }
                       .navigationTitle("VoxCPM2")
                   }
                   .fileImporter(
-                      isPresented: $showingImporter,
+                      isPresented:
+                          $showingImporter,
                       allowedContentTypes: [
                           .audio,
                           .wav
                       ],
                       allowsMultipleSelection: false
                   ) { result in
+
                       switch result {
+
                       case .success(let urls):
-                          referenceURL = urls.first
-                          status = "参考音频已选择"
+
+                          referenceURL =
+                              urls.first
+
+                          status =
+                              "参考音频已选择"
 
                       case .failure(let error):
-                          status = error.localizedDescription
+
+                          status =
+                              error.localizedDescription
                       }
                   }
               }
 
               private func generate() {
+
+                  guard
+                      let referenceURL
+                  else {
+                      status =
+                          "请先选择参考音频"
+                      return
+                  }
+
                   isGenerating = true
-                  status = "正在加载 VoxCPM2……"
+                  status =
+                      "正在加载 VoxCPM2……"
+
+                  let text =
+                      targetText
 
                   Task.detached {
+
                       do {
-                          guard let modelURL = Bundle.main.url(
-                              forResource: "Model",
-                              withExtension: nil
-                          ) else {
+
+                          guard
+                              let modelURL =
+                                  Bundle.main.url(
+                                      forResource:
+                                          "Model",
+                                      withExtension:
+                                          nil
+                                  )
+                          else {
                               throw NSError(
-                                  domain: "VoxCPM2",
+                                  domain:
+                                      "VoxCPM2",
                                   code: -10,
                                   userInfo: [
                                       NSLocalizedDescriptionKey:
-                                          "找不到模型文件"
+                                          "找不到模型"
                                   ]
                               )
                           }
 
-                          guard let engine = VoxCPM2Engine(
-                              modelURL: modelURL
-                          ) else {
+                          guard
+                              let engine =
+                                  VoxCPM2Engine(
+                                      modelURL:
+                                          modelURL
+                                  )
+                          else {
                               throw NSError(
-                                  domain: "VoxCPM2",
+                                  domain:
+                                      "VoxCPM2",
                                   code: -11,
                                   userInfo: [
                                       NSLocalizedDescriptionKey:
@@ -356,111 +645,188 @@ jobs:
                               )
                           }
 
-                          var samples: [Float] = []
-                          var sampleRate: Int32 = 24000
+                          let audio =
+                              try AVAudioFile(
+                                  forReading:
+                                      referenceURL
+                              )
 
-                          if let referenceURL {
-                              let audio = try AVAudioFile(forReading: referenceURL)
+                          let format =
+                              audio.processingFormat
 
-                              sampleRate =
-                                  Int32(audio.processingFormat.sampleRate)
-
-                              let frameCount = AVAudioFrameCount(
+                          let frameCount =
+                              AVAudioFrameCount(
                                   audio.length
                               )
 
-                              let buffer = AVAudioPCMBuffer(
-                                  pcmFormat: audio.processingFormat,
-                                  frameCapacity: frameCount
-                              )!
-
-                              try audio.read(into: buffer)
-
-                              if let channel = buffer.floatChannelData?[0] {
-                                  samples = Array(
-                                      UnsafeBufferPointer(
-                                          start: channel,
-                                          count: Int(buffer.frameLength)
-                                      )
+                          guard
+                              let buffer =
+                                  AVAudioPCMBuffer(
+                                      pcmFormat:
+                                          format,
+                                      frameCapacity:
+                                          frameCount
                                   )
-                              }
+                          else {
+                              throw NSError(
+                                  domain:
+                                      "VoxCPM2",
+                                  code: -12
+                              )
                           }
 
-                          let result = try engine.generate(
-                              text: targetText,
-                              referenceSamples: samples,
-                              sampleRate: sampleRate
+                          try audio.read(
+                              into: buffer
                           )
 
-                          let wavURL = FileManager.default
-                              .urls(
-                                  for: .documentDirectory,
-                                  in: .userDomainMask
-                              )[0]
-                              .appendingPathComponent(
-                                  "voxcpm2-output.wav"
+                          guard
+                              let channel =
+                                  buffer.floatChannelData?[0]
+                          else {
+                              throw NSError(
+                                  domain:
+                                      "VoxCPM2",
+                                  code: -13
+                              )
+                          }
+
+                          let samples =
+                              Array(
+                                  UnsafeBufferPointer(
+                                      start: channel,
+                                      count:
+                                          Int(
+                                              buffer.frameLength
+                                          )
+                                  )
                               )
 
-                          let format = AVAudioFormat(
-                              commonFormat: .pcmFormatFloat32,
-                              sampleRate: Double(result.1),
-                              channels: 1,
-                              interleaved: false
-                          )!
+                          let result =
+                              try engine.generate(
+                                  text: text,
+                                  referenceSamples:
+                                      samples,
+                                  sampleRate:
+                                      Int32(
+                                          format.sampleRate
+                                      )
+                              )
 
-                          let audioFile = try AVAudioFile(
-                              forWriting: wavURL,
-                              settings: format.settings
-                          )
+                          let documents =
+                              FileManager.default
+                                  .urls(
+                                      for:
+                                          .documentDirectory,
+                                      in:
+                                          .userDomainMask
+                                  )[0]
 
-                          let frameCount = UInt32(
-                              result.0.count /
-                              MemoryLayout<Float>.size
-                          )
+                          let outputURL =
+                              documents
+                                  .appendingPathComponent(
+                                      "voxcpm2-output.wav"
+                                  )
 
-                          let buffer = AVAudioPCMBuffer(
-                              pcmFormat: format,
-                              frameCapacity: frameCount
-                          )!
+                          let outputFormat =
+                              AVAudioFormat(
+                                  commonFormat:
+                                      .pcmFormatFloat32,
+                                  sampleRate:
+                                      Double(
+                                          result.1
+                                      ),
+                                  channels: 1,
+                                  interleaved:
+                                      false
+                              )!
 
-                          buffer.frameLength = frameCount
+                          let outputFile =
+                              try AVAudioFile(
+                                  forWriting:
+                                      outputURL,
+                                  settings:
+                                      outputFormat.settings
+                              )
 
-                          result.0.withUnsafeBytes { rawBuffer in
-                              if let base = rawBuffer.baseAddress,
-                                 let destination =
-                                    buffer.floatChannelData?[0] {
+                          let frameCount =
+                              UInt32(
+                                  result.0.count /
+                                  MemoryLayout<Float>.size
+                              )
+
+                          let outputBuffer =
+                              AVAudioPCMBuffer(
+                                  pcmFormat:
+                                      outputFormat,
+                                  frameCapacity:
+                                      frameCount
+                              )!
+
+                          outputBuffer.frameLength =
+                              frameCount
+
+                          result.0.withUnsafeBytes {
+                              rawBuffer in
+
+                              if
+                                  let source =
+                                      rawBuffer.baseAddress,
+                                  let destination =
+                                      outputBuffer
+                                          .floatChannelData?[0]
+                              {
+
                                   memcpy(
                                       destination,
-                                      base,
+                                      source,
                                       result.0.count
                                   )
                               }
                           }
 
-                          try audioFile.write(from: buffer)
+                          try outputFile.write(
+                              from:
+                                  outputBuffer
+                          )
 
                           await MainActor.run {
-                              do {
-                                  self.player =
-                                      try AVAudioPlayer(contentsOf: wavURL)
-                                  self.player?.prepareToPlay()
-                                  self.player?.play()
 
-                                  self.status =
+                              do {
+
+                                  player =
+                                      try AVAudioPlayer(
+                                          contentsOf:
+                                              outputURL
+                                      )
+
+                                  player?.prepareToPlay()
+                                  player?.play()
+
+                                  status =
                                       "生成完成，正在播放"
-                                  self.isGenerating = false
+
+                                  isGenerating =
+                                      false
+
                               } catch {
-                                  self.status =
-                                      "生成完成，但播放失败：\(error.localizedDescription)"
-                                  self.isGenerating = false
+
+                                  status =
+                                      "生成完成，但播放失败"
+
+                                  isGenerating =
+                                      false
                               }
                           }
 
                       } catch {
+
                           await MainActor.run {
-                              self.status =
+
+                              status =
                                   "失败：\(error.localizedDescription)"
-                              self.isGenerating = false
+
+                              isGenerating =
+                                  false
                           }
                       }
                   }
@@ -468,57 +834,54 @@ jobs:
           }
           EOF
 
+      # ============================================================
+      # 14. App 主入口
+      # ============================================================
+      - name: Create app entry
+        run: |
+
           cat > VoxCPM2App/Sources/VoxCPM2App.swift <<'EOF'
           import SwiftUI
 
           @main
           struct VoxCPM2App: App {
+
               var body: some Scene {
+
                   WindowGroup {
+
                       ContentView()
                   }
               }
           }
           EOF
 
-      - name: Copy runtime
-        run: |
-          mkdir -p VoxCPM2App/Runtime
-
-          find build -type f \
-            -name "libvoxcpm2_ncnn.dylib" \
-            -exec cp {} VoxCPM2App/Runtime/ \;
-
-          cp include/voxcpm2/c_api.h \
-            VoxCPM2App/Sources/c_api.h
-
-          echo "=== Runtime ==="
-          ls -lah VoxCPM2App/Runtime
-
+      # ============================================================
+      # 15. 创建 Xcode 项目
+      # ============================================================
       - name: Create Xcode project
         run: |
+
           cd VoxCPM2App
 
           cat > project.yml <<'EOF'
           name: VoxCPM2
 
           options:
-            bundleIdPrefix: app.cancer5207
             deploymentTarget:
-              iOS: "17.0"
+              iOS: "18.0"
 
           settings:
             base:
               PRODUCT_BUNDLE_IDENTIFIER: app.cancer5207.vanilla4000
-              SWIFT_VERSION: 5.0
               DEVELOPMENT_TEAM: TRFB7RR82Y
+              SWIFT_VERSION: 5.0
               CODE_SIGN_STYLE: Manual
               CODE_SIGN_IDENTITY: "Apple Distribution"
               TARGETED_DEVICE_FAMILY: "1,2"
-              INFOPLIST_KEY_NSCameraUsageDescription: "用于录制参考音频"
-              INFOPLIST_KEY_NSMicrophoneUsageDescription: "用于录制参考音频"
 
           targets:
+
             VoxCPM2:
               type: application
               platform: iOS
@@ -532,44 +895,76 @@ jobs:
               settings:
                 base:
                   PRODUCT_NAME: VoxCPM2
-                  SWIFT_OBJC_BRIDGING_HEADER: Sources/VoxCPM2Bridge.h
+
+                  SWIFT_OBJC_BRIDGING_HEADER:
+                    $(SRCROOT)/Sources/VoxCPM2Bridge.h
+
                   HEADER_SEARCH_PATHS:
-                    - "$(SRCROOT)/Sources"
+                    - $(SRCROOT)/Sources
+
                   LIBRARY_SEARCH_PATHS:
-                    - "$(SRCROOT)/Runtime"
+                    - $(SRCROOT)/Runtime
+
                   OTHER_LDFLAGS:
-                    - "-lvoxcpm2_ncnn"
+                    - -lvoxcpm2_ncnn
+
+                  LD_RUNPATH_SEARCH_PATHS:
+                    - "@executable_path/Frameworks"
+                    - "@loader_path/../Frameworks"
 
               info:
                 path: Info.plist
+
                 properties:
-                  CFBundleDisplayName: VoxCPM2
+
+                  CFBundleDisplayName:
+                    VoxCPM2
+
                   UILaunchScreen: {}
 
-              dependencies: []
+                  NSMicrophoneUsageDescription:
+                    用于录制参考音频
 
-              preBuildScripts: []
-
-              postBuildScripts: []
+                  NSSpeechRecognitionUsageDescription:
+                    用于语音处理
           EOF
 
           xcodegen generate
 
+      # ============================================================
+      # 16. 导入 P12
+      # ============================================================
       - name: Install signing certificate
         env:
           P12_BASE64: ${{ secrets.P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+
         run: |
-          echo "$P12_BASE64" | base64 --decode > signing.p12
+
+          if [ -z "$P12_BASE64" ]; then
+            echo "ERROR: P12_BASE64 is empty."
+            exit 1
+          fi
+
+          if [ -z "$P12_PASSWORD" ]; then
+            echo "ERROR: P12_PASSWORD is empty."
+            exit 1
+          fi
+
+          echo "$P12_BASE64" \
+            | base64 --decode \
+            > signing.p12
 
           security create-keychain \
-            -p "" build.keychain
+            -p "" \
+            build.keychain
 
           security default-keychain \
             -s build.keychain
 
           security unlock-keychain \
-            -p "" build.keychain
+            -p "" \
+            build.keychain
 
           security import signing.p12 \
             -k build.keychain \
@@ -583,21 +978,40 @@ jobs:
             -k "" \
             build.keychain
 
+      # ============================================================
+      # 17. 导入 provisioning profile
+      # ============================================================
       - name: Install provisioning profile
         env:
-          MOBILEPROVISION_BASE64: ${{ secrets.MOBILEPROVISION_BASE64 }}
+          MOBILEPROVISION_BASE64:
+            ${{ secrets.MOBILEPROVISION_BASE64 }}
+
         run: |
+
+          if [ -z "$MOBILEPROVISION_BASE64" ]; then
+            echo "ERROR: MOBILEPROVISION_BASE64 is empty."
+            exit 1
+          fi
+
           echo "$MOBILEPROVISION_BASE64" \
             | base64 --decode \
             > profile.mobileprovision
 
-          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p \
+            "$HOME/Library/MobileDevice/Provisioning Profiles"
 
-          cp profile.mobileprovision \
+          cp \
+            profile.mobileprovision \
             "$HOME/Library/MobileDevice/Provisioning Profiles/12efe78d-808d-4360-a62e-52644dc3f44f.mobileprovision"
 
-      - name: Build IPA
+          echo "Provisioning profile installed."
+
+      # ============================================================
+      # 18. 签名并 Archive
+      # ============================================================
+      - name: Archive iOS app
         run: |
+
           cd VoxCPM2App
 
           xcodebuild \
@@ -613,25 +1027,39 @@ jobs:
             clean archive \
             -archivePath "$PWD/VoxCPM2.xcarchive"
 
+      # ============================================================
+      # 19. 导出 IPA
+      # ============================================================
+      - name: Export IPA
+        run: |
+
+          cd VoxCPM2App
+
           mkdir -p export
 
-          cat > ExportOptions.plist <<EOF
+          cat > ExportOptions.plist <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
             "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+
           <plist version="1.0">
           <dict>
+
               <key>method</key>
               <string>ad-hoc</string>
+
               <key>teamID</key>
               <string>TRFB7RR82Y</string>
+
               <key>signingStyle</key>
               <string>manual</string>
+
               <key>provisioningProfiles</key>
               <dict>
                   <key>app.cancer5207.vanilla4000</key>
                   <string>app.cancer5207.vanilla4000</string>
               </dict>
+
           </dict>
           </plist>
           EOF
@@ -642,8 +1070,13 @@ jobs:
             -exportPath "$PWD/export" \
             -exportOptionsPlist "$PWD/ExportOptions.plist"
 
+      # ============================================================
+      # 20. 上传 IPA
+      # ============================================================
       - name: Upload IPA
         uses: actions/upload-artifact@v4
+
         with:
           name: VoxCPM2-iOS-IPA
           path: VoxCPM2App/export/*.ipa
+          if-no-files-found: error
