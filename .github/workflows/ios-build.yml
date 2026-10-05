@@ -20,7 +20,7 @@ jobs:
 
       - name: Build iPhone arm64 runtime
         run: |
-          xmake f \
+          xmake f -y \
             -p iphoneos \
             -a arm64 \
             -m release \
