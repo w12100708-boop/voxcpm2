@@ -1,62 +1,46 @@
 name: Build VoxCPM2 iOS Runtime
-
 on:
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: macos-15-intel
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
-
       - name: Install xmake
         run: |
           brew install xmake
-
-      - name: Prepare ncnn RTTI
+      - name: Update xmake repositories
         run: |
           xmake repo --update
-
-          echo "=== Finding ncnn xmake recipe ==="
-          NCNN_RECIPE=$(find "$HOME/.xmake" \
-            -path "*/packages/n/ncnn/xmake.lua" \
-            -type f | head -n 1)
-
-          if [ -z "$NCNN_RECIPE" ]; then
-            echo "ERROR: ncnn xmake recipe not found"
-            exit 1
-          fi
-
-          echo "Found: $NCNN_RECIPE"
-
-          python3 - "$NCNN_RECIPE" <<'PY'
-          import sys
+      - name: Enable RTTI in ncnn
+        run: |
+          NCNN_FILE="/Users/runner/.xmake/repositories/xmake-repo/packages/n/ncnn/xmake.lua"
+          echo "=== Checking ncnn recipe ==="
+          test -f "$NCNN_FILE"
+          echo "=== Before patch ==="
+          grep -n "NCNN_BUILD_EXAMPLES" "$NCNN_FILE"
+          python3 - <<'PY'
           from pathlib import Path
-
-          p = Path(sys.argv[1])
+          p = Path("/Users/runner/.xmake/repositories/xmake-repo/packages/n/ncnn/xmake.lua")
           s = p.read_text()
-
-          target = 'table.insert(configs, "-DNCNN_BUILD_EXAMPLES=OFF")'
-
-          if "-DNCNN_DISABLE_RTTI=OFF" not in s:
-              s = s.replace(
-                  target,
-                  target + '\ntable.insert(configs, "-DNCNN_DISABLE_RTTI=OFF")'
-              )
-
-          p.write_text(s)
-          print("RTTI patch applied.")
+          old = '            "-DNCNN_BUILD_EXAMPLES=OFF",'
+          new = old + '\n            "-DNCNN_DISABLE_RTTI=OFF",'
+          if new in s:
+              print("RTTI option already present.")
+          elif old in s:
+              s = s.replace(old, new, 1)
+              p.write_text(s)
+              print("RTTI option inserted successfully.")
+          else:
+              raise SystemExit("Could not find the ncnn CMake configuration line.")
           PY
-
-          echo "=== Checking RTTI patch ==="
-          grep -n "NCNN_DISABLE_RTTI" "$NCNN_RECIPE"
-
-      - name: Build iPhone arm64 runtime
+          echo "=== After patch ==="
+          grep -n "NCNN_DISABLE_RTTI" "$NCNN_FILE"
+      - name: Configure iPhone arm64
         run: |
           xmake f -y \
             -p iphoneos \
@@ -64,9 +48,9 @@ jobs:
             -m release \
             --appledev=iphone \
             --profile=false
-
-          xmake build voxcpm2_ncnn_shared
-
+      - name: Build VoxCPM2 iOS runtime
+        run: |
+          xmake build -y voxcpm2_ncnn_shared
       - name: Locate build output
         run: |
           echo "=== Searching for VoxCPM2 library ==="
@@ -75,19 +59,17 @@ jobs:
             -o -name "*.dylib" \
             -o -name "*.a" \
           \) -print || true
-
       - name: Package runtime
         run: |
           mkdir -p artifact
-
           find build -type f \
-            \( -name "libvoxcpm2_ncnn.dylib" \
-            -o -name "libvoxcpm2_ncnn.a" \) \
+            \( \
+              -name "libvoxcpm2_ncnn.dylib" \
+              -o -name "libvoxcpm2_ncnn.a" \
+            \) \
             -exec cp {} artifact/ \; || true
-
           echo "=== Artifact ==="
           ls -lah artifact
-
       - name: Upload runtime
         uses: actions/upload-artifact@v4
         with:
