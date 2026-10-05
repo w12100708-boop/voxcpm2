@@ -25,7 +25,8 @@ jobs:
             -a arm64 \
             -m release \
             --appledev=iphone \
-            --profile=false
+            --profile=false \
+            --rtti=true
 
           xmake build voxcpm2_ncnn_shared
 
